@@ -347,6 +347,41 @@ class TradingBot:
             raise ValueError("Groq AI geçerli JSON döndürmedi")
         return json.loads(match.group(0)), msg
 
+    def _ai_response_format(self):
+        """Groq GPT-OSS için strict Structured Outputs şeması.
+        V17'deki json_object çağrısı bazı isteklerde 400 failed_generation üretiyordu.
+        GPT-OSS 20B strict json_schema desteklediği için cevabı doğrudan şemaya kilitliyoruz.
+        """
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "crypto_reviews",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "reviews": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "symbol": {"type": "string"},
+                                    "score": {"type": "integer", "minimum": 0, "maximum": 100},
+                                    "decision": {"type": "string", "enum": ["AL", "BEKLE"]},
+                                    "risk": {"type": "string", "enum": ["DÜŞÜK", "ORTA", "YÜKSEK"]},
+                                    "summary": {"type": "string"}
+                                },
+                                "required": ["symbol", "score", "decision", "risk", "summary"],
+                                "additionalProperties": False
+                            }
+                        }
+                    },
+                    "required": ["reviews"],
+                    "additionalProperties": False
+                }
+            }
+        }
+
     def _ai_fallback_batch(self, candidates, failure_text):
         """Small single-call fallback for the whole candidate batch.
         Never call this after a 429: the gateway already put Groq in cooldown.
@@ -373,7 +408,9 @@ class TradingBot:
             ],
             "max_completion_tokens": 700,
             "temperature": 0.1,
-            "response_format": {"type": "json_object"}
+            "reasoning_effort": "low",
+            "reasoning_format": "hidden",
+            "response_format": self._ai_response_format(),
         }
         data = self._ai_request(payload, {
             "Authorization": f"Bearer {self.groq_key}",
@@ -461,7 +498,9 @@ class TradingBot:
             ],
             "max_completion_tokens": 500,
             "temperature": 0.1,
-            "response_format": {"type": "json_object"}
+            "reasoning_effort": "low",
+            "reasoning_format": "hidden",
+            "response_format": self._ai_response_format(),
         }
         try:
             data = self._ai_request(payload, {

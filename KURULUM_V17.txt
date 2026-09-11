@@ -1,4 +1,4 @@
-YATIRIM BOTU V17 KURULUM
+YATIRIM BOTU V18 KURULUM
 
 1) GitHub
 - V16 dosyalarının yerine bu ZIP içindeki dosyaları koy.
@@ -24,7 +24,7 @@ YATIRIM BOTU V17 KURULUM
 Render -> Manual Deploy -> Deploy latest commit.
 
 4) Kontrol
-Panelde Yatırım Botu V17 ve 'web araştırması kapalı' yazmalı. AI isteği tek toplu çağrıdır. 429 olursa otomatik cooldown uygulanır.
+Panelde Yatırım Botu V18 ve 'web araştırması kapalı' yazmalı. AI isteği tek toplu çağrıdır. 429 olursa otomatik cooldown uygulanır.
 
 5) Güvenlik
 DRY_RUN=true bırak. Gerçek para ile işlem açmadan önce sanal AL/SAT zincirini doğrula.

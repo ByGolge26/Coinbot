@@ -1,6 +1,6 @@
-# Yatırım Botu V17
+# Yatırım Botu V18
 
-V17, V17 üzerinden hazırlanmıştır. Ana değişiklikler:
+V18, V18 üzerinden hazırlanmıştır. Ana değişiklikler:
 
 - Groq AI artık aday başına ayrı çağrı yapmak yerine adayları **tek toplu AI isteğinde** değerlendirir.
 - `groq/compound-mini` için yalnızca `web_search` etkin bırakılır.
@@ -35,4 +35,4 @@ Gerekli:
 Gerçek para ile çalıştırmadan önce DRY RUN ile tarama, sanal AL ve sanal SAT zincirini doğrulayın. Kâr garantisi yoktur.
 
 
-V17: Groq normal chat modeli kullanır, Groq Compound/web araştırması tamamen kapalıdır. AI yalnızca botun hesapladığı teknik veriyi değerlendirir. Varsayılan model: openai/gpt-oss-20b. ChatGPT Go aboneliği API anahtarı olarak kullanılamaz; GROQ_API_KEY gerekir. DRY_RUN=true ile test edilmelidir.
+V18: Groq normal chat modeli kullanır, Groq Compound/web araştırması tamamen kapalıdır. AI yalnızca botun hesapladığı teknik veriyi değerlendirir. Varsayılan model: openai/gpt-oss-20b. ChatGPT Go aboneliği API anahtarı olarak kullanılamaz; GROQ_API_KEY gerekir. DRY_RUN=true ile test edilmelidir.
