@@ -35,6 +35,7 @@ class TradingBot:
         self.ai_candidates = min(10, max(3, int(os.getenv("AI_CANDIDATES", "5"))))
         self.ai_min_score = min(100, max(50, int(os.getenv("AI_MIN_SCORE", "70"))))
         self.ai_model = os.getenv("AI_MODEL", "groq/compound-mini")
+        self.ai_fallback_model = os.getenv("AI_FALLBACK_MODEL", "openai/gpt-oss-20b")
         self.ai_cache_minutes = max(5, int(os.getenv("AI_CACHE_MINUTES", "15")))
         self.last_ai_at = {}
         self.allow_without_ai = os.getenv("ALLOW_WITHOUT_AI", "false").lower() == "true"
@@ -50,6 +51,7 @@ class TradingBot:
         self.ai_review_count = 0
         self.data_source = "Coinbase public market data"
         self.last_scan_ms = 0
+        self.last_trade_block_reason = "Henüz tarama yapılmadı."
 
         self.trade_stats = {
             "buy_count": 0,
@@ -276,15 +278,85 @@ class TradingBot:
             "time": self.now_tr().strftime("%H:%M:%S")
         }
 
+    def _compact_ai_result(self, parsed, sources=None):
+        """Normalize a model result into the panel's small, predictable shape."""
+        sources = sources or []
+        score = max(0, min(100, int(float(parsed.get("score", 0)))))
+        decision = parsed.get("decision", "BEKLE")
+        if decision not in ("AL", "BEKLE"):
+            decision = "BEKLE"
+        risk = parsed.get("risk", "ORTA")
+        if risk not in ("DÜŞÜK", "ORTA", "YÜKSEK"):
+            risk = "ORTA"
+        return {
+            "score": score,
+            "decision": decision,
+            "risk": risk,
+            "summary": str(parsed.get("summary", ""))[:500],
+            "positive": [str(x)[:160] for x in (parsed.get("positive") or [])[:2]],
+            "negative": [str(x)[:160] for x in (parsed.get("negative") or [])[:2]],
+            "sources": sources[:3]
+        }
+
+    def _ai_request(self, payload, headers, timeout=60):
+        r = requests.post(GROQ_CHAT, headers=headers, json=payload, timeout=timeout)
+        if not r.ok:
+            try:
+                err = r.json().get("error", {})
+                detail = err.get("message") if isinstance(err, dict) else str(err)
+            except Exception:
+                detail = r.text.strip()
+            raise RuntimeError(f"Groq HTTP {r.status_code}: {detail[:500]}")
+        return r.json()
+
+    def _parse_ai_message(self, data):
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        out = (msg.get("content") or "").strip()
+        if "```" in out:
+            out = out.replace("```json", "").replace("```", "").strip()
+        match = re.search(r"\{.*\}", out, re.S)
+        if not match:
+            raise ValueError("Groq AI geçerli JSON döndürmedi")
+        return json.loads(match.group(0)), msg
+
+    def _ai_fallback(self, c, failure_text):
+        """Use a small text-only model if Compound is rejected (e.g. 413)."""
+        prompt = (
+            "Kripto işlem filtresi. Web araması kullanma; yalnızca verilen veriyi değerlendir. "
+            f"Coin {c['symbol']} ({c['name']}), fiyat {c['price']:.8g} USD, 24s {c['change24']:+.2f}%, "
+            f"RSI {c['rsi']:.1f}, hacim {c['volume_ratio']:.2f}x, teknik {c['score']}/7. "
+            "Güçlü yükseliş yapısı ve makul risk varsa AL; aksi halde BEKLE. "
+            "Yalnızca şu JSON: "
+            '{"score":0,"decision":"AL|BEKLE","risk":"DÜŞÜK|ORTA|YÜKSEK",'
+            '"summary":"en fazla 2 kısa Türkçe cümle","positive":[],"negative":[]}'
+        )
+        payload = {
+            "model": self.ai_fallback_model,
+            "messages": [
+                {"role": "system", "content": "Türkçe yanıt ver. Sadece geçerli JSON döndür."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_completion_tokens": 300,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"}
+        }
+        data = self._ai_request(payload, {
+            "Authorization": f"Bearer {self.groq_key}",
+            "Content-Type": "application/json"
+        }, timeout=45)
+        parsed, _ = self._parse_ai_message(data)
+        result = self._compact_ai_result(parsed)
+        result["summary"] = (result["summary"] + " • Web araştırması yedek AI ile atlandı.").strip()
+        return result
+
     def ai_research(self, candidates):
         """
-        V14: Groq Compound Mini ile çok küçük istek gövdesi kullanır.
-        413 Request Entity Too Large hatasını azaltmak için:
-        - Tek adayı tek çağrıda araştırır.
-        - Prompt yalnızca karar için gerekli kısa teknik özeti içerir.
-        - Sadece web_search aracı etkinleştirilir.
-        - Eski/advanced Compound sürümü yerine 2025-07-23 temel web araması
-          kullanılır; böylece gereksiz araç/ziyaret çıktıları oluşmaz.
+        V15: Compound Mini önce çok küçük bir web araştırması yapar. 413/400/422
+        gibi model/tool kaynaklı hatalarda işlem tamamen kilitlenmez; küçük bir
+        text-only GPT-OSS 20B JSON çağrısına düşer. Böylece AI servisi geçici
+        olarak sorun çıkarsa panel sonsuza kadar 'Yeni işlem açılmadı' durumunda
+        kalmaz. Fallback web doğrulaması yapmaz, bu nedenle yüksek riskli bir
+        adayda yine teknik/AI kapısı korunur.
         """
         if not self.groq_key:
             msg = "GROQ_API_KEY yok. Render Environment Variables'a ekle."
@@ -297,7 +369,6 @@ class TradingBot:
 
         reviews = {}
         now_ts = time.time()
-
         for c in candidates:
             cached = self.ai_reviews.get(c["symbol"])
             cached_at = self.last_ai_at.get(c["symbol"], 0)
@@ -305,103 +376,63 @@ class TradingBot:
                 reviews[c["symbol"]] = cached
                 continue
 
-            # Çok küçük, deterministik prompt. Mum geçmişi veya ham dataframe
-            # kesinlikle Groq'a gönderilmez.
             prompt = (
-                "Kripto AL filtresi yap. Güncel web aramasıyla yalnızca son 72 saatte "
-                "önemli risk/katalizör var mı kontrol et. Coin: "
-                f"{c['symbol']} ({c['name']}); fiyat={c['price']:.8g} USD; "
-                f"24s={c['change24']:+.2f}%; RSI5={c['rsi']:.1f}; "
-                f"hacim5={c['volume_ratio']:.2f}x; teknik={c['score']}/7. "
-                "Hack, exploit, delist, unlock/arzdaki artış, ağ sorunu veya ciddi "
-                "negatif haber varsa AL verme. Teknik ve haber görünümü uygunsa AL ver. "
+                "Kripto AL filtresi. Güncel web aramasıyla son 72 saatte yalnızca ciddi risk/katalizörleri kontrol et. "
+                f"Coin {c['symbol']} ({c['name']}), fiyat {c['price']:.8g} USD, 24s {c['change24']:+.2f}%, "
+                f"RSI5 {c['rsi']:.1f}, hacim5 {c['volume_ratio']:.2f}x, teknik {c['score']}/7. "
+                "Hack, exploit, delist, büyük unlock/arzdaki artış, ağ sorunu veya ciddi negatif haber varsa BEKLE. "
+                "Teknik yapı ve haber görünümü uygunsa AL. "
                 "Yalnızca şu JSON'u döndür: "
                 '{"score":0,"decision":"AL|BEKLE","risk":"DÜŞÜK|ORTA|YÜKSEK",'
-                '"summary":"en fazla 2 kısa Türkçe cümle",'
-                '"positive":["en fazla 2"],"negative":["en fazla 2"]}'
+                '"summary":"en fazla 2 kısa Türkçe cümle","positive":["en fazla 2"],"negative":["en fazla 2"]}'
             )
-
             payload = {
                 "model": self.ai_model,
                 "messages": [
-                    {"role": "system", "content": "Türkçe yanıt ver. Sadece JSON döndür."},
+                    {"role": "system", "content": "Türkçe yanıt ver. Sadece geçerli JSON döndür."},
                     {"role": "user", "content": prompt}
                 ],
-                "max_completion_tokens": 700
+                "max_completion_tokens": 350,
+                "temperature": 0.1,
+                "compound_custom": {"tools": {"enabled_tools": ["web_search"]}}
             }
-
             try:
-                r = requests.post(
-                    GROQ_CHAT,
-                    headers={
-                        "Authorization": f"Bearer {self.groq_key}",
-                        "Content-Type": "application/json",
-                        # Temel web araması. Latest/advanced arama çıktısı
-                        # gereksiz büyüme yapmasın.
-                        "Groq-Model-Version": "2025-07-23"
-                    },
-                    json=payload,
-                    timeout=60
-                )
-                if not r.ok:
-                    try:
-                        err = r.json().get("error", {})
-                        detail = err.get("message") if isinstance(err, dict) else str(err)
-                    except Exception:
-                        detail = r.text.strip()
-                    raise RuntimeError(f"Groq HTTP {r.status_code}: {detail[:500]}")
-
-                data = r.json()
-                msg = ((data.get("choices") or [{}])[0].get("message") or {})
-                out = (msg.get("content") or "").strip()
-
-                if "```" in out:
-                    out = out.replace("```json", "").replace("```", "").strip()
-                match = re.search(r"\{.*\}", out, re.S)
-                if not match:
-                    raise ValueError("Groq AI geçerli JSON döndürmedi")
-                parsed = json.loads(match.group(0))
-
-                # Compound yanıtında kaynaklar gelirse yalnızca ilk 3 kaynağı tut.
-                auto_sources = []
+                data = self._ai_request(payload, {
+                    "Authorization": f"Bearer {self.groq_key}",
+                    "Content-Type": "application/json",
+                    "Groq-Model-Version": "latest"
+                })
+                parsed, msg = self._parse_ai_message(data)
+                sources = []
                 for tool in (msg.get("executed_tools") or []):
                     if not isinstance(tool, dict):
                         continue
-                    results = tool.get("search_results") or []
-                    if isinstance(results, list):
-                        for item in results[:3]:
-                            if isinstance(item, dict):
-                                url = item.get("url") or item.get("link")
-                                title = item.get("title") or item.get("name") or "Web kaynağı"
-                                if url:
-                                    auto_sources.append({"title": str(title)[:120], "url": str(url)[:500]})
-
-                parsed_sources = parsed.get("sources") or auto_sources
-                if not isinstance(parsed_sources, list):
-                    parsed_sources = []
-
-                reviews[c["symbol"]] = {
-                    "score": max(0, min(100, int(parsed.get("score", 0)))),
-                    "decision": parsed.get("decision", "BEKLE") if parsed.get("decision") in ("AL", "BEKLE") else "BEKLE",
-                    "risk": parsed.get("risk", "ORTA") if parsed.get("risk") in ("DÜŞÜK", "ORTA", "YÜKSEK") else "ORTA",
-                    "summary": str(parsed.get("summary", ""))[:500],
-                    "positive": [str(x)[:160] for x in (parsed.get("positive") or [])[:2]],
-                    "negative": [str(x)[:160] for x in (parsed.get("negative") or [])[:2]],
-                    "sources": parsed_sources[:3]
-                }
+                    for item in (tool.get("search_results") or [])[:3]:
+                        if isinstance(item, dict):
+                            url = item.get("url") or item.get("link")
+                            title = item.get("title") or item.get("name") or "Web kaynağı"
+                            if url:
+                                sources.append({"title": str(title)[:120], "url": str(url)[:500]})
+                result = self._compact_ai_result(parsed, sources)
+                result["summary"] = result["summary"] or "Web araştırması tamamlandı."
+                reviews[c["symbol"]] = result
                 self.last_ai_at[c["symbol"]] = now_ts
-                self.ai_reviews[c["symbol"]] = reviews[c["symbol"]]
-
+                self.ai_reviews[c["symbol"]] = result
             except Exception as e:
-                # 413 artık panelde açıkça görülecek. Otomatik fallback:
-                # Compound Mini gövde boyutu nedeniyle reddederse, aynı küçük
-                # teknik özeti web'siz standart Groq modeline göndermiyoruz;
-                # AI kapısı güvenlik gereği işlem açılmasını engelliyor.
-                reviews[c["symbol"]] = {
-                    "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
-                    "summary": f"Groq AI araştırması başarısız: {type(e).__name__}: {e}. Yeni işlem açılmadı.",
-                    "positive": [], "negative": [], "sources": []
-                }
+                # 413/400/422 dahil: küçük fallback çağrısı.
+                try:
+                    result = self._ai_fallback(c, str(e))
+                    result["fallback"] = True
+                    result["fallback_reason"] = str(e)[:220]
+                    reviews[c["symbol"]] = result
+                    self.last_ai_at[c["symbol"]] = now_ts
+                    self.ai_reviews[c["symbol"]] = result
+                except Exception as e2:
+                    reviews[c["symbol"]] = {
+                        "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
+                        "summary": f"AI araştırması başarısız: {type(e).__name__}: {e}; yedek AI: {type(e2).__name__}: {e2}",
+                        "positive": [], "negative": [], "sources": []
+                    }
         return reviews
 
     def open_sim(self, s):
@@ -504,8 +535,8 @@ class TradingBot:
                         "reason": reason, "time": now
                     })
                     del self.positions[symbol]
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_error = f"Pozisyon yönetimi {symbol}: {type(e).__name__}: {e}"
 
     def tick(self):
         if not self.running:
@@ -563,13 +594,29 @@ class TradingBot:
             if x["decision"] == "AL ADAYI"
             and (x.get("ai") or {}).get("decision") == "AL"
             and (x.get("ai") or {}).get("score",0) >= self.ai_min_score
+            and (x.get("ai") or {}).get("risk") != "YÜKSEK"
         ]
         ranked_buy.sort(key=lambda x: ((x.get("ai") or {}).get("score",0), x["score"], x["change24"]), reverse=True)
 
+        if not ranked_buy:
+            ai_al = [x for x in results if (x.get("ai") or {}).get("decision") == "AL"]
+            if not ai_al:
+                self.last_trade_block_reason = f"Alım yok: AI {self.ai_min_score}+ skorlu AL adayı üretmedi."
+            else:
+                best = max((x.get("ai") or {}).get("score",0) for x in ai_al)
+                self.last_trade_block_reason = f"Alım yok: en yüksek AI skoru {best}/100; gereken {self.ai_min_score}."
+        else:
+            self.last_trade_block_reason = f"{len(ranked_buy)} uygun AL adayı bulundu; pozisyon açma denendi."
+
+        opened_count = 0
         for s in ranked_buy:
             if len(self.positions) >= self.max_positions or self.balance_try < self.min_buy_try:
+                self.last_trade_block_reason = "Alım sırası durdu: aktif sermaye veya bakiye sınırı."
                 break
-            self.open_sim(s)
+            if self.open_sim(s):
+                opened_count += 1
+        if opened_count:
+            self.last_trade_block_reason = f"{opened_count} sanal pozisyon açıldı."
 
         self.last_scan_ms = int(time.time()*1000)
 
@@ -601,7 +648,7 @@ class TradingBot:
             "signals": ranked[:25],
             "scanned_count": self.scanned_count,
             "ai_review_count": self.ai_review_count,
-            "last_check": self.last_check, "last_error": self.last_error,
+            "last_check": self.last_check, "last_error": self.last_error, "trade_block_reason": self.last_trade_block_reason,
             "settings": self.settings(),
             "data_source": self.data_source,
             "entry_logic": "Adaptif teknik filtre (>=5/7, trend+MACD, en az 1 üst zaman dilimi) + Groq AI web araştırması + AI onayı",

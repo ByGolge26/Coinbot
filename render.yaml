@@ -12,7 +12,7 @@ services:
       - key: ENTRY_SCORE
         value: "4"
       - key: SCAN_LIMIT
-        value: "25"
+        value: "40"
       - key: MAX_OPEN_POSITIONS
         value: "20"
       - key: POSITION_SIZE_PCT
@@ -28,6 +28,8 @@ services:
         value: "150"
       - key: AI_MODEL
         value: "groq/compound-mini"
+      - key: AI_FALLBACK_MODEL
+        value: "openai/gpt-oss-20b"
       - key: AI_CANDIDATES
         value: "8"
       - key: AI_CACHE_MINUTES
