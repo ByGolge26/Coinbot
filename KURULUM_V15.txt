@@ -1,9 +1,0 @@
-V15 KURULUM
-
-1) ZIP içeriğini GitHub projesine yükle.
-2) Render > Manual Deploy > Deploy latest commit.
-3) Environment Variables: GROQ_API_KEY mevcut anahtarın olarak kalsın. AI_MODEL=groq/compound-mini. AI_FALLBACK_MODEL=openai/gpt-oss-20b.
-4) DRY_RUN=true bırak.
-5) Panelde Başlat.
-6) Artık alım olmadığında üstte "Alım yok: ..." nedeni görünür.
-7) Groq Compound 413/400/422 olursa küçük fallback AI denenir.
