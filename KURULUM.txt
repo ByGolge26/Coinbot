@@ -1,0 +1,17 @@
+V12 - GROQ 400 HATASI DÜZELTİLDİ
+
+Render:
+GROQ_API_KEY = gsk_...
+AI_MODEL = groq/compound-mini
+AI_CANDIDATES = 8
+AI_MIN_SCORE = 70
+AI_CACHE_MINUTES = 15
+ALLOW_WITHOUT_AI = false
+DRY_RUN = true
+
+V11'deki `citation_options` alanı kaldırıldı. Groq Compound web search
+kaynaklarını otomatik döndürür.
+
+Groq'un güncel fiyatlandırmasında Compound Mini web search aracının ayrıca
+ücretlendirilebildiğini unutma. Kullanım öncesi Groq hesabındaki güncel
+fiyatları kontrol et.

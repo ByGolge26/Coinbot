@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="tr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#09090c"><title>Yatırım Botu V10</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#09090c;color:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,Arial}.wrap{max-width:780px;margin:auto;padding:20px 14px 35px}.head{display:flex;justify-content:space-between;align-items:center}.title{font-size:28px;font-weight:800}.sub{color:#8e8e93;font-size:13px;margin-top:3px}.card{background:#17171c;border:1px solid #2a2a31;border-radius:22px;padding:16px;margin:12px 0}.notice{background:#302611;color:#f2c96d;padding:12px;border-radius:14px;margin:14px 0;font-size:13px}.error{background:#3a1515;color:#ff938c;padding:12px;border-radius:14px;margin:10px 0;font-size:12px;word-break:break-word}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.metric{background:#202025;border-radius:16px;padding:13px}.label{font-size:11px;color:#999}.big{font-size:19px;font-weight:800;margin-top:5px}.row{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px;margin-top:9px}
+button{border:0;border-radius:15px;padding:14px;font-size:16px;font-weight:800}.start{background:#32d74b}.stop{background:#ff453a;color:white}.scan{background:#2c2c32;color:white;width:100%;margin-top:10px}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;background:#777}.on{background:#32d74b}.off{background:#ff453a}
+.section{font-size:19px;font-weight:800;margin-bottom:10px}.muted{color:#92929a}.green{color:#65e77b}.red{color:#ff6b63}.yellow{color:#f2c96d}.coin{padding:13px 0;border-bottom:1px solid #29292f}.coin:last-child{border-bottom:0}.coinhead{display:flex;justify-content:space-between;align-items:center}.name{font-weight:800;font-size:15px}.price{font-size:11px;color:#aaa;margin-top:3px}.score{background:#303037;padding:6px 8px;border-radius:9px;font-size:11px;font-weight:800}.al{background:#193b22;color:#69e87b}.wait{background:#303037;color:#bbb}.ai{background:#23344a;color:#83c8ff}.checks{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.check{font-size:10px;padding:5px 7px;border-radius:8px}.yes{background:#193b22;color:#69e87b}.no{background:#3a2422;color:#ff8c84}.reasons{font-size:10px;color:#92929a;line-height:1.5;margin-top:7px}.aibox{margin-top:8px;padding:9px;border-radius:11px;background:#202b38;font-size:11px}.src{font-size:10px;color:#7f8790;margin-top:5px;word-break:break-all}
+.tradebox{background:#202025;border:1px solid #303038;border-radius:16px;padding:12px;margin:9px 0}.tradegrid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:10px}.tradegrid div{background:#29292f;border-radius:10px;padding:8px}.tradegrid span{display:block;color:#999;font-size:9px}.tradegrid b{display:block;margin-top:3px;font-size:12px}
+input{width:100%;background:#24242a;border:1px solid #38383f;color:white;padding:12px;border-radius:12px;font-size:15px}label{font-size:11px;color:#999;display:block;margin:8px 0 5px}
+table{width:100%;border-collapse:collapse;font-size:11px}td{padding:8px 2px;border-bottom:1px solid #29292f}.r{text-align:right}.footer{text-align:center;color:#666;font-size:10px;margin-top:18px}
+@media(max-width:420px){.title{font-size:24px}.big{font-size:17px}}
+</style></head><body><div class="wrap">
+<div class="head"><div><div class="title">🤖 Yatırım Botu V10</div><div class="sub">Groq AI + web araştırmalı iPhone paneli</div></div><div id="state">...</div></div>
+<div class="notice">🛡️ <b>DRY RUN</b> aktif. Gerçek para kullanılmıyor. 🧠 Groq AI + güncel web araştırması yalnızca teknik olarak güçlü adaylarda çalışıyor.</div>
+<div id="error"></div>
+<div class="card"><div class="grid">
+<div class="metric"><div class="label">Toplam sermaye</div><div class="big" id="bal">-</div></div><div class="metric"><div class="label">Toplam K/Z</div><div class="big" id="pnl">-</div></div>
+<div class="metric"><div class="label">Açık işlem</div><div class="big" id="op">0</div></div><div class="metric"><div class="label">Taranan coin</div><div class="big" id="scanned">0</div></div>
+<div class="metric"><div class="label">AI araştırılan</div><div class="big" id="airev">0</div></div><div class="metric"><div class="label">Türkiye saati</div><div class="big" style="font-size:12px" id="trtime">-</div></div>
+</div>
+<div class="row"><button class="start" onclick="ctl('/api/start')">▶ Başlat</button><button class="stop" onclick="ctl('/api/stop')">■ Durdur</button></div>
+<button class="scan" onclick="ctl('/api/scan')">🔎 Şimdi Tüm Piyasayı Tara</button>
+<div class="muted" style="font-size:10px;margin-top:9px" id="runtime"></div></div>
+
+<div class="card"><div class="section">📊 Günlük Özet</div><div class="row3">
+<div class="metric"><div class="label">Günlük K/Z</div><div class="big" id="dp">-</div></div><div class="metric"><div class="label">Alış hacmi</div><div class="big" id="db">-</div></div><div class="metric"><div class="label">Satış hacmi</div><div class="big" id="ds">-</div></div>
+</div><div class="row3"><div class="metric"><div class="label">Kazanan</div><div class="big" id="wins">0</div></div><div class="metric"><div class="label">Kaybeden</div><div class="big" id="losses">0</div></div><div class="metric"><div class="label">Başarı</div><div class="big" id="wr">0%</div></div></div></div>
+
+<div class="card"><div class="section">🏆 Groq AI Filtreli En Güçlü Adaylar</div><div id="signals">Yükleniyor...</div><div class="src" id="source"></div><div class="src" id="logic"></div></div>
+<div class="card"><div class="section">💼 Açık İşlemler</div><div id="positions">Yok.</div></div>
+
+<div class="card"><div class="section">⚙️ Risk / Groq AI Ayarları</div><div class="grid">
+<div><label>İşlem riski %</label><input id="risk" type="number" step=".1"></div><div><label>Take Profit %</label><input id="tp" type="number" step=".1"></div>
+<div><label>Stop Loss %</label><input id="sl" type="number" step=".1"></div><div><label>Trailing %</label><input id="tr" type="number" step=".1"></div>
+<div><label>Pozisyon başına %</label><input id="pospct" type="number" min="1" max="25" step=".5"></div><div><label>Aktif sermaye %</label><input id="activepct" type="number" min="5" max="100"></div>
+<div><label>Minimum alış TL</label><input id="minbuy" type="number" min="1000" step="50"></div><div><label>Minimum zarar TL</label><input id="minloss" type="number" min="100" step="10"></div>
+<div><label>Minimum kâr TL</label><input id="minprofit" type="number" min="150" step="10"></div><div><label>AI min skor</label><input id="aimin" type="number" min="50" max="100"></div>
+<div><label>AI aday sayısı</label><input id="aicand" type="number" min="3" max="10"></div><div><label>Taranacak coin</label><input id="limit" type="number" min="10" max="60"></div>
+<div><label>Maks. açık işlem</label><input id="maxpos" type="number" min="1" max="20"></div><div><label>AL teknik skor (4-5)</label><input id="entry" type="number" min="4" max="5"></div>
+</div><button class="scan" onclick="save()">Ayarları Kaydet ve Yeniden Tara</button></div>
+
+<div class="card"><div class="section">📜 İşlem Geçmişi</div><div id="hist">Henüz işlem yok.</div></div>
+<div class="footer">Tarama yaklaşık 60 sn • Panel 10 sn yenilenir • AI web araştırması API kullanımı/ücretlendirmesine tabi olabilir.</div>
+</div>
+
+<script>
+const fmt=x=>new Intl.NumberFormat('tr-TR',{minimumFractionDigits:2,maximumFractionDigits:2}).format(x);
+function check(k,v){return `<span class="check ${v?'yes':'no'}">${v?'✓':'✕'} ${k}</span>`}
+function aiBlock(s){if(!s.ai)return '';return `<div class="aibox"><b>🤖 AI: ${s.ai.decision} • ${s.ai.score}/100 • ${s.ai.risk||''}</b><br>${s.ai.summary||''}${(s.ai.sources||[]).slice(0,3).map(x=>`<div class="src">• ${x.title||x.url||''}</div>`).join('')}</div>`}
+async function load(){
+ try{
+  const d=await(await fetch('/api/status',{cache:'no-store'})).json();
+  bal.textContent=fmt(d.balance_try)+' TL';
+  pnl.textContent=(d.pnl>=0?'+':'')+fmt(d.pnl)+' TL'; pnl.className='big '+(d.pnl>=0?'green':'red');
+  op.textContent=d.positions.length; scanned.textContent=d.scanned_count; airev.textContent=d.ai_review_count;
+  trtime.textContent=d.runtime.now_tr; runtime.textContent='Aktif süre: '+d.runtime.uptime_text+' • Oturum başlangıcı: '+d.runtime.started_at_tr;
+  state.innerHTML='<span class="dot '+(d.running?'on':'off')+'"></span>'+(d.running?'AKTİF':'DURDURULDU');
+  error.innerHTML=d.last_error?'<div class="error">⚠️ '+d.last_error+'</div>':'';
+  source.textContent='Veri: '+d.data_source;
+  logic.textContent='Giriş: '+d.entry_logic+' • '+d.exit_logic;
+
+  let z=d.daily_stats||{}; dp.textContent=(z.daily_pnl>=0?'+':'')+fmt(z.daily_pnl)+' TL'; dp.className='big '+(z.daily_pnl>=0?'green':'red');
+  db.textContent=fmt(z.total_buy_try||0)+' TL'; ds.textContent=fmt(z.total_sell_try||0)+' TL'; wins.textContent=z.wins||0; losses.textContent=z.losses||0; wr.textContent=fmt(z.win_rate||0)+'%';
+
+  signals.innerHTML=d.signals.length?d.signals.map(s=>`
+    <div class="coin"><div class="coinhead"><div><div class="name">${s.symbol} <span class="muted">${s.name||''}</span></div>
+    <div class="price">${fmt(s.price)} USD • RSI ${s.rsi.toFixed(1)} • 24s ${s.change24>=0?'+':''}${s.change24.toFixed(2)}%</div></div>
+    <div class="score ${s.final_decision==='AL'?'al':s.ai?'ai':'wait'}">${s.final_decision} • ${s.score}/7${s.ai?' • AI '+s.ai.score:''}</div></div>
+    <div class="checks">${Object.entries(s.checks).map(([k,v])=>check(k,v)).join('')}</div>
+    <div class="reasons">${s.reasons.join(' • ')}</div>${aiBlock(s)}</div>`).join(''):'Henüz tarama sonucu yok.';
+
+  positions.innerHTML=d.positions.length?d.positions.map(p=>`
+    <div class="tradebox"><div class="coinhead"><div><b>${p.symbol}</b><div class="price">${p.name||''}</div></div><div class="score al">AÇIK</div></div>
+    <div class="tradegrid">
+      <div><span>Alış TL</span><b>${fmt(p.buy_amount_try)} TL</b></div><div><span>Coin miktarı</span><b>${p.qty.toFixed(8)}</b></div>
+      <div><span>Giriş</span><b>${fmt(p.entry)} USD</b></div><div><span>Güncel</span><b>${fmt(p.last)} USD</b></div>
+      <div><span>AI skoru</span><b>${p.ai_score}/100</b></div><div><span>AI risk</span><b>${p.ai_risk||'-'}</b></div>
+      <div><span>Gerçekleşmemiş K/Z</span><b class="${p.unrealized>=0?'green':'red'}">${p.unrealized>=0?'+':''}${fmt(p.unrealized)} TL</b></div>
+      <div><span>Min satış kârı</span><b>+${fmt(d.settings.min_profit_try)} TL</b></div>
+    </div></div>`).join(''):'Açık işlem yok.';
+
+  hist.innerHTML=d.history.length?'<table>'+d.history.slice(0,15).map(h=>`
+    <tr><td><b>${h.type==='OPEN'?'🟢 AL':'🔴 SAT'}</b> ${h.symbol}<br><span class="muted">${h.reason||''} • ${h.time}</span><br>
+    <span class="muted">Alış: ${h.buy_try?fmt(h.buy_try)+' TL':'-'} • Satış: ${h.sell_try?fmt(h.sell_try)+' TL':'-'}</span></td>
+    <td class="r">${h.type==='CLOSE'?(h.pnl>=0?'<span class="green">+':'<span class="red">')+fmt(h.pnl)+' TL</span>':'AÇILDI'}</td></tr>`).join('')+'</table>':'Henüz işlem yok.';
+
+  if(!window.init){risk.value=(d.settings.risk*100).toFixed(1);tp.value=(d.settings.tp*100).toFixed(1);sl.value=(d.settings.sl*100).toFixed(1);tr.value=(d.settings.trailing*100).toFixed(1);pospct.value=(d.settings.position_pct*100).toFixed(1);activepct.value=(d.settings.active_capital_pct*100).toFixed(0);minbuy.value=d.settings.min_buy_try;minloss.value=d.settings.min_loss_try;minprofit.value=d.settings.min_profit_try;aimin.value=d.settings.ai_min_score;aicand.value=d.settings.ai_candidates;limit.value=d.settings.scan_limit;maxpos.value=d.settings.max_positions;entry.value=d.settings.entry_score;window.init=1}
+ }catch(e){state.textContent='Bağlantı hatası'}
+}
+async function ctl(u){await fetch(u,{method:'POST'});await load()}
+async function save(){
+ const body={risk:+risk.value,tp:+tp.value,sl:+sl.value,trailing:+tr.value,position_pct:+pospct.value,active_capital_pct:+activepct.value,
+ min_buy_try:+minbuy.value,min_loss_try:+minloss.value,min_profit_try:+minprofit.value,ai_min_score:+aimin.value,ai_candidates:+aicand.value,
+ scan_limit:+limit.value,max_positions:+maxpos.value,entry_score:+entry.value};
+ const d=await(await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+ if(!d.ok){alert(d.error);return} await ctl('/api/scan');
+}
+load();setInterval(load,10000);
+</script></body></html>

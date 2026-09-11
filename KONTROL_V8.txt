@@ -1,0 +1,29 @@
+V8 KONTROL VE DÜZELTMELER
+
+Yüklenen 08.09.2026 tarihli bot raporuna göre:
+- Sermaye 4.936,07 TL
+- Toplam K/Z -63,93 TL
+- 335 kapanmış işlem (117 kazanç, 218 kayıp)
+- Başarı oranı %34,90
+- Günlük K/Z +3,04 TL
+- Açık işlem sayısı 10
+- Çok küçük pozisyonlar görülüyor: XRP 7,16 TL; ARB 9,02 TL; LIGHTER 9,50 TL vb.
+- Bazı AL sinyallerinde hacim 0,05x / 0,10x / 0,13x gibi çok düşük olmasına rağmen 4/5 skorla AL oluşuyor.
+
+V8'de:
+1) Minimum alış 1.000 TL altına düşemez.
+2) Minimum zarar eşiği -100 TL.
+3) Minimum kâr eşiği +150 TL.
+4) Trailing, ancak en az +150 TL kâr görüldükten sonra devreye girer ve +150 TL'nin altında satış yapamaz.
+5) AL için EMA20>EMA50 + MACD + Hacim zorunlu; toplam skor en az 4/5.
+6) RSI tekrar 50-65 bandına sıkılaştırıldı.
+7) Aktif sermaye limiti korunuyor; küçük bakiyelerle sahte "çoklu pozisyon" açılması engellendi.
+8) Panelde minimum alış/zarar/kâr ayarları görünür.
+9) Panelde çıkış kuralı ve her pozisyonun alış/satış/P&L bilgisi görünür.
+
+BAŞARI ORANI:
+%34,90'ın ana nedenleri düşük kaliteli AL sinyalleri, 5 dakikalık gürültü, aşırı sık yeniden giriş ve çok küçük kâr/zararla kapanan işlemler.
+V8 bunları azaltır ancak başarı oranı garanti edilmez. Daha da yükseltmek için bir sonraki aşama 15m/1h trend doğrulaması, yeniden giriş soğuma süresi ve backtest/Walk-forward testidir.
+
+GERÇEK İŞLEM:
+DRY_RUN true kalmalıdır. Bu V8 gerçek emir göndermez.
