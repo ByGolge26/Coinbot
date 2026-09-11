@@ -1,24 +1,18 @@
-YATIRIM BOTU V12 - GROQ 400 HATASI DÜZELTİLDİ
+YATIRIM BOTU V14 - GROQ 413 KESIN DUZELTME
 
-V12, V11'de Groq Compound API'ye gönderilen geçersiz `citation_options`
-alanını kaldırır. Groq'un Compound API'si web arama kaynaklarını yanıt içinde
-otomatik olarak döndürür; ayrı bir citation_options alanı göndermek gerekmez.
+V14, V13'te görülen "Groq HTTP 413: Request Entity Too Large" hatasına karşı
+Groq isteğini küçültür ve web araştırmasını yalnızca gerekli adaylarda yapar.
 
-Ayrıca HTTP hata gövdesi artık panel/log tarafında ayrıntılı gösterilir.
-
-AI:
-- Model: groq/compound-mini
-- Built-in web search: web_search
-- AI adayları: 8
-- Minimum AI skoru: 70
-- AI çalışmazsa yeni işlem açılmaz.
-
-ÖNEMLİ ÜCRET NOTU:
-Groq'un güncel dokümantasyonunda Compound Mini'nin yerleşik web araması
-ayrı bir araç ücretiyle listelenmektedir. Bu nedenle "ücretsiz AI" ifadesi
-model/API ücretsiz kotası anlamına gelebilir; web araması sınırsız ücretsiz
-değildir. Gerçek kullanım ücretleri Groq hesabındaki güncel fiyatlandırmaya
-göre kontrol edilmelidir.
+Temel değişiklikler:
+- Groq'a ham mum/dataframe gönderilmez.
+- Her AI çağrısında yalnızca kısa teknik özet gönderilir.
+- Sadece web_search etkinleştirilir; gereksiz Compound araçları kullanılmaz.
+- Groq-Model-Version: 2025-07-23 kullanılır; daha hafif temel web araması tercih edilir.
+- AI çıktısı en fazla kısa JSON olarak istenir.
+- Kaynaklar panelde en fazla 3 adet tutulur.
+- 413 dahil gerçek Groq hata mesajı panelde gösterilir.
+- AI hatası varsa güvenlik gereği yeni işlem açılmaz.
+- DRY_RUN=true olarak kalır.
 
 Render Environment Variables:
 GROQ_API_KEY = Groq API anahtarın
@@ -30,8 +24,13 @@ ALLOW_WITHOUT_AI = false
 DRY_RUN = true
 
 Kurulum:
-1. GitHub'da V12 dosyalarını mevcut proje ile değiştir.
+1. GitHub'daki mevcut bot dosyalarını V14 ZIP içindeki dosyalarla değiştir.
 2. Commit/push yap.
 3. Render -> Manual Deploy -> Deploy latest commit.
-4. GROQ_API_KEY'in Environment Variables altında bulunduğunu kontrol et.
-5. DRY_RUN=true kalsın.
+4. Render Environment'ta GROQ_API_KEY'in bulunduğunu kontrol et.
+5. Panel başlığında "Yatırım Botu V14" görünmelidir.
+6. DRY RUN açıkken önce tarama ve sanal işlem zincirini test et.
+
+Not:
+Groq'un güncel dokümanına göre HTTP 413, istek gövdesinin fazla büyük olduğunu belirtir.
+V14 bu riski azaltmak için istemci tarafındaki AI payload'unu ciddi biçimde küçültür.
