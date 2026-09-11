@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: yatirim-botu
+    name: yatirim-botu-v17
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
@@ -27,7 +27,7 @@ services:
       - key: MIN_PROFIT_TRY
         value: "150"
       - key: AI_MODEL
-        value: "groq/compound-mini"
+        value: "openai/gpt-oss-20b"
       - key: AI_FALLBACK_MODEL
         value: "openai/gpt-oss-20b"
       - key: AI_CANDIDATES

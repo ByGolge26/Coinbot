@@ -15,3 +15,6 @@ kaynaklarını otomatik döndürür.
 Groq'un güncel fiyatlandırmasında Compound Mini web search aracının ayrıca
 ücretlendirilebildiğini unutma. Kullanım öncesi Groq hesabındaki güncel
 fiyatları kontrol et.
+
+
+V17: Groq normal chat modeli kullanır, Groq Compound/web araştırması tamamen kapalıdır. AI yalnızca botun hesapladığı teknik veriyi değerlendirir. Varsayılan model: openai/gpt-oss-20b. ChatGPT Go aboneliği API anahtarı olarak kullanılamaz; GROQ_API_KEY gerekir. DRY_RUN=true ile test edilmelidir.
