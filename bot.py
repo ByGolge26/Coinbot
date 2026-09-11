@@ -1,5 +1,5 @@
 
-import os, time, json, requests, pandas as pd, numpy as np
+import os, time, json, re, requests, pandas as pd, numpy as np
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -278,76 +278,56 @@ class TradingBot:
 
     def ai_research(self, candidates):
         """
-        Free-tier AI research via Groq Compound Mini.
-        Compound Mini can perform real-time web search server-side.
-        The API key is still required, but the Groq Free plan has rate limits
-        and does not require paid OpenAI access.
+        V14: Groq Compound Mini ile çok küçük istek gövdesi kullanır.
+        413 Request Entity Too Large hatasını azaltmak için:
+        - Tek adayı tek çağrıda araştırır.
+        - Prompt yalnızca karar için gerekli kısa teknik özeti içerir.
+        - Sadece web_search aracı etkinleştirilir.
+        - Eski/advanced Compound sürümü yerine 2025-07-23 temel web araması
+          kullanılır; böylece gereksiz araç/ziyaret çıktıları oluşmaz.
         """
         if not self.groq_key:
-            msg = "GROQ_API_KEY yok. Groq ücretsiz API anahtarını Render Environment Variables'a ekle."
-            if self.allow_without_ai:
-                return {c["symbol"]: {
-                    "score": 0, "decision": "AI YOK", "risk": "Bilinmiyor",
-                    "summary": msg + " AI kapısı atlandı.",
-                    "positive": [], "negative": [], "sources": []
-                } for c in candidates}
+            msg = "GROQ_API_KEY yok. Render Environment Variables'a ekle."
+            decision = "AI YOK" if self.allow_without_ai else "AI ONAYI GEREKLİ"
             return {c["symbol"]: {
-                "score": 0, "decision": "AI ONAYI GEREKLİ", "risk": "Bilinmiyor",
-                "summary": msg + " Yeni işlem açılmadı.",
+                "score": 0, "decision": decision, "risk": "Bilinmiyor",
+                "summary": msg + (" AI kapısı atlandı." if self.allow_without_ai else " Yeni işlem açılmadı."),
                 "positive": [], "negative": [], "sources": []
             } for c in candidates}
 
         reviews = {}
         now_ts = time.time()
+
         for c in candidates:
             cached = self.ai_reviews.get(c["symbol"])
             cached_at = self.last_ai_at.get(c["symbol"], 0)
             if cached and (now_ts - cached_at) < self.ai_cache_minutes * 60:
                 reviews[c["symbol"]] = cached
                 continue
-            prompt = f"""
-Sen kripto piyasası için AL öncesi risk araştırması yapan bir yardımcı analistsin.
-Coin: {c['symbol']} ({c['name']})
-Piyasa: Coinbase spot
-Fiyat: {c['price']}
-24s değişim: {c['change24']:+.2f}%
-5dk RSI: {c['rsi']:.1f}
-5dk hacim oranı: {c['volume_ratio']:.2f}x
-Teknik skor: {c['score']}/7
-Teknik gerekçeler: {'; '.join(c['reasons'])}
 
-ÖNCE web araması yap. Son 24-72 saatte coin/proje hakkında önemli gelişmeleri,
-resmi duyuruları ve güvenilir finans/kripto haberlerini kontrol et.
-Özellikle hack/exploit, delist, token unlock veya arz artışı, regülasyon,
-ağ kesintisi, ekip/proje problemi, büyük ortaklık/katalizör ve aşırı spekülasyon
-risklerini ara. Güncel veri bulamazsan bunu açıkça belirt.
-
-Sonra teknik veriler + güncel haber/riskleri birlikte değerlendir.
-Kesin kâr garantisi verme. Amaç sadece AL için risk filtresi uygulamaktır.
-
-SADECE TEK BİR JSON nesnesi döndür. Markdown kullanma:
-{{
- "score": 0-100,
- "decision": "AL" veya "BEKLE",
- "risk": "DÜŞÜK"|"ORTA"|"YÜKSEK",
- "summary": "Türkçe, en fazla 3 kısa cümle",
- "positive": ["en fazla 3 madde"],
- "negative": ["en fazla 3 madde"],
- "sources": [{{"title":"kaynak başlığı","url":"https://..."}}]
-}}
-
-AL kararı ancak güncel haber/risk görünümü makul ve teknik sinyal yeterince güçlü ise ver.
-"""
+            # Çok küçük, deterministik prompt. Mum geçmişi veya ham dataframe
+            # kesinlikle Groq'a gönderilmez.
+            prompt = (
+                "Kripto AL filtresi yap. Güncel web aramasıyla yalnızca son 72 saatte "
+                "önemli risk/katalizör var mı kontrol et. Coin: "
+                f"{c['symbol']} ({c['name']}); fiyat={c['price']:.8g} USD; "
+                f"24s={c['change24']:+.2f}%; RSI5={c['rsi']:.1f}; "
+                f"hacim5={c['volume_ratio']:.2f}x; teknik={c['score']}/7. "
+                "Hack, exploit, delist, unlock/arzdaki artış, ağ sorunu veya ciddi "
+                "negatif haber varsa AL verme. Teknik ve haber görünümü uygunsa AL ver. "
+                "Yalnızca şu JSON'u döndür: "
+                '{"score":0,"decision":"AL|BEKLE","risk":"DÜŞÜK|ORTA|YÜKSEK",'
+                '"summary":"en fazla 2 kısa Türkçe cümle",'
+                '"positive":["en fazla 2"],"negative":["en fazla 2"]}'
+            )
 
             payload = {
                 "model": self.ai_model,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "Türkçe yanıt ver. Güncel web araştırmasını kullan. Yalnızca istenen JSON nesnesini döndür."
-                    },
+                    {"role": "system", "content": "Türkçe yanıt ver. Sadece JSON döndür."},
                     {"role": "user", "content": prompt}
-                ]
+                ],
+                "max_completion_tokens": 700
             }
 
             try:
@@ -356,10 +336,12 @@ AL kararı ancak güncel haber/risk görünümü makul ve teknik sinyal yeterinc
                     headers={
                         "Authorization": f"Bearer {self.groq_key}",
                         "Content-Type": "application/json",
-                        "Groq-Model-Version": "latest"
+                        # Temel web araması. Latest/advanced arama çıktısı
+                        # gereksiz büyüme yapmasın.
+                        "Groq-Model-Version": "2025-07-23"
                     },
                     json=payload,
-                    timeout=75
+                    timeout=60
                 )
                 if not r.ok:
                     try:
@@ -367,12 +349,12 @@ AL kararı ancak güncel haber/risk görünümü makul ve teknik sinyal yeterinc
                         detail = err.get("message") if isinstance(err, dict) else str(err)
                     except Exception:
                         detail = r.text.strip()
-                    raise RuntimeError(f"Groq HTTP {r.status_code}: {detail}")
+                    raise RuntimeError(f"Groq HTTP {r.status_code}: {detail[:500]}")
+
                 data = r.json()
                 msg = ((data.get("choices") or [{}])[0].get("message") or {})
                 out = (msg.get("content") or "").strip()
 
-                # Extract a JSON object even if the model accidentally wraps it in prose.
                 if "```" in out:
                     out = out.replace("```json", "").replace("```", "").strip()
                 match = re.search(r"\{.*\}", out, re.S)
@@ -380,43 +362,41 @@ AL kararı ancak güncel haber/risk görünümü makul ve teknik sinyal yeterinc
                     raise ValueError("Groq AI geçerli JSON döndürmedi")
                 parsed = json.loads(match.group(0))
 
-                # Groq may expose web-search results in executed_tools.
+                # Compound yanıtında kaynaklar gelirse yalnızca ilk 3 kaynağı tut.
                 auto_sources = []
                 for tool in (msg.get("executed_tools") or []):
-                    sr = tool.get("search_results") if isinstance(tool, dict) else None
-                    if isinstance(sr, list):
-                        for item in sr[:8]:
+                    if not isinstance(tool, dict):
+                        continue
+                    results = tool.get("search_results") or []
+                    if isinstance(results, list):
+                        for item in results[:3]:
                             if isinstance(item, dict):
                                 url = item.get("url") or item.get("link")
                                 title = item.get("title") or item.get("name") or "Web kaynağı"
                                 if url:
-                                    auto_sources.append({"title": title, "url": url})
+                                    auto_sources.append({"title": str(title)[:120], "url": str(url)[:500]})
 
-                sources = parsed.get("sources") or auto_sources
+                parsed_sources = parsed.get("sources") or auto_sources
+                if not isinstance(parsed_sources, list):
+                    parsed_sources = []
+
                 reviews[c["symbol"]] = {
                     "score": max(0, min(100, int(parsed.get("score", 0)))),
-                    "decision": parsed.get("decision", "BEKLE"),
-                    "risk": parsed.get("risk", "ORTA"),
-                    "summary": parsed.get("summary", ""),
-                    "positive": parsed.get("positive", []),
-                    "negative": parsed.get("negative", []),
-                    "sources": sources[:8]
+                    "decision": parsed.get("decision", "BEKLE") if parsed.get("decision") in ("AL", "BEKLE") else "BEKLE",
+                    "risk": parsed.get("risk", "ORTA") if parsed.get("risk") in ("DÜŞÜK", "ORTA", "YÜKSEK") else "ORTA",
+                    "summary": str(parsed.get("summary", ""))[:500],
+                    "positive": [str(x)[:160] for x in (parsed.get("positive") or [])[:2]],
+                    "negative": [str(x)[:160] for x in (parsed.get("negative") or [])[:2]],
+                    "sources": parsed_sources[:3]
                 }
                 self.last_ai_at[c["symbol"]] = now_ts
                 self.ai_reviews[c["symbol"]] = reviews[c["symbol"]]
 
-            except requests.HTTPError as e:
-                status = getattr(e.response, "status_code", None)
-                if status == 429:
-                    detail = "Groq ücretsiz kullanım limiti doldu (429). Sonraki taramada tekrar denenecek."
-                else:
-                    detail = f"Groq HTTP hatası: {status or 'bilinmiyor'}"
-                reviews[c["symbol"]] = {
-                    "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
-                    "summary": detail + " Yeni işlem açılmadı.",
-                    "positive": [], "negative": [], "sources": []
-                }
             except Exception as e:
+                # 413 artık panelde açıkça görülecek. Otomatik fallback:
+                # Compound Mini gövde boyutu nedeniyle reddederse, aynı küçük
+                # teknik özeti web'siz standart Groq modeline göndermiyoruz;
+                # AI kapısı güvenlik gereği işlem açılmasını engelliyor.
                 reviews[c["symbol"]] = {
                     "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
                     "summary": f"Groq AI araştırması başarısız: {type(e).__name__}: {e}. Yeni işlem açılmadı.",
