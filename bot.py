@@ -344,16 +344,10 @@ AL kararı ancak güncel haber/risk görünümü makul ve teknik sinyal yeterinc
                 "messages": [
                     {
                         "role": "system",
-                        "content": "Türkçe yanıt ver. Web araştırmasını kullan. Yalnızca istenen JSON nesnesini döndür."
+                        "content": "Türkçe yanıt ver. Güncel web araştırmasını kullan. Yalnızca istenen JSON nesnesini döndür."
                     },
                     {"role": "user", "content": prompt}
-                ],
-                "compound_custom": {
-                    "tools": {
-                        "enabled_tools": ["web_search"]
-                    }
-                },
-                "citation_options": "enabled"
+                ]
             }
 
             try:
@@ -367,7 +361,13 @@ AL kararı ancak güncel haber/risk görünümü makul ve teknik sinyal yeterinc
                     json=payload,
                     timeout=75
                 )
-                r.raise_for_status()
+                if not r.ok:
+                    try:
+                        err = r.json().get("error", {})
+                        detail = err.get("message") if isinstance(err, dict) else str(err)
+                    except Exception:
+                        detail = r.text.strip()
+                    raise RuntimeError(f"Groq HTTP {r.status_code}: {detail}")
                 data = r.json()
                 msg = ((data.get("choices") or [{}])[0].get("message") or {})
                 out = (msg.get("content") or "").strip()
