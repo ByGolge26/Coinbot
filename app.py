@@ -16,7 +16,7 @@ def status():
 @app.post("/api/start")
 def start():
     bot.running = True
-    bot.tick()
+    bot.next_scan_at = 0
     return jsonify(ok=True, status=bot.status())
 
 @app.post("/api/stop")
@@ -27,7 +27,7 @@ def stop():
 @app.post("/api/scan")
 def scan():
     bot.running = True
-    bot.tick()
+    bot.tick(force=True)
     return jsonify(ok=True, status=bot.status())
 
 @app.post("/api/settings")
@@ -41,10 +41,10 @@ def settings():
 def worker():
     while True:
         try:
-            bot.tick()
+            bot.tick(force=False)
         except Exception as e:
             bot.last_error = f"{type(e).__name__}: {e}"
-        time.sleep(60)
+        time.sleep(5)
 
 if __name__ == "__main__":
     threading.Thread(target=worker, daemon=True).start()

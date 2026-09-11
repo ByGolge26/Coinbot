@@ -1,5 +1,6 @@
 
 import os, time, json, re, requests, pandas as pd, numpy as np
+import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -52,6 +53,14 @@ class TradingBot:
         self.data_source = "Coinbase public market data"
         self.last_scan_ms = 0
         self.last_trade_block_reason = "Henüz tarama yapılmadı."
+        self.scan_interval_seconds = max(120, int(os.getenv("SCAN_INTERVAL_SECONDS", "600")))
+        self.next_scan_at = 0.0
+        self.tick_lock = threading.Lock()
+        self.last_ai_error = None
+        self.groq_cooldown_until = 0.0
+        self.last_groq_status = "Hazır"
+        self.last_ai_request_at = None
+        self.ai_batch_size = 0
 
         self.trade_stats = {
             "buy_count": 0,
@@ -95,7 +104,7 @@ class TradingBot:
             "scan_limit": self.scan_limit, "min_buy_try": self.min_buy_try,
             "min_loss_try": self.min_loss_try, "min_profit_try": self.min_profit_try,
             "ai_candidates": self.ai_candidates, "ai_min_score": self.ai_min_score,
-            "ai_model": self.ai_model, "ai_provider": "Groq Compound Mini (web search)", "ai_cache_minutes": self.ai_cache_minutes
+            "ai_model": self.ai_model, "ai_provider": "Groq Compound Mini (web search)", "ai_cache_minutes": self.ai_cache_minutes, "scan_interval_seconds": self.scan_interval_seconds
         }
 
     def update_settings(self, d):
@@ -299,6 +308,14 @@ class TradingBot:
         }
 
     def _ai_request(self, payload, headers, timeout=60):
+        # One centralized Groq gateway. 429 is handled here so fallback calls
+        # do not immediately hammer the same rate-limited endpoint again.
+        now = time.time()
+        if now < self.groq_cooldown_until:
+            wait = max(1, int(self.groq_cooldown_until - now))
+            raise RuntimeError(f"Groq rate limit bekleme süresi: {wait} sn")
+
+        self.last_ai_request_at = self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
         r = requests.post(GROQ_CHAT, headers=headers, json=payload, timeout=timeout)
         if not r.ok:
             try:
@@ -306,7 +323,18 @@ class TradingBot:
                 detail = err.get("message") if isinstance(err, dict) else str(err)
             except Exception:
                 detail = r.text.strip()
+            if r.status_code == 429:
+                retry_after = r.headers.get("retry-after")
+                try:
+                    wait = max(10, min(900, int(float(retry_after)))) if retry_after else 60
+                except Exception:
+                    wait = 60
+                self.groq_cooldown_until = time.time() + wait
+                self.last_groq_status = f"429 rate limit • {wait} sn bekleme"
+                raise RuntimeError(f"Groq HTTP 429: rate limit. {wait} sn bekle")
+            self.last_groq_status = f"HTTP {r.status_code}"
             raise RuntimeError(f"Groq HTTP {r.status_code}: {detail[:500]}")
+        self.last_groq_status = "200 OK"
         return r.json()
 
     def _parse_ai_message(self, data):
@@ -319,16 +347,23 @@ class TradingBot:
             raise ValueError("Groq AI geçerli JSON döndürmedi")
         return json.loads(match.group(0)), msg
 
-    def _ai_fallback(self, c, failure_text):
-        """Use a small text-only model if Compound is rejected (e.g. 413)."""
+    def _ai_fallback_batch(self, candidates, failure_text):
+        """Small single-call fallback for the whole candidate batch.
+        Never call this after a 429: the gateway already put Groq in cooldown.
+        """
+        items = []
+        for c in candidates:
+            items.append({
+                "symbol": c["symbol"], "name": c["name"],
+                "price": round(c["price"], 8), "change24": round(c["change24"], 2),
+                "rsi": round(c["rsi"], 1), "volume_ratio": round(c["volume_ratio"], 2),
+                "technical_score": c["score"]
+            })
         prompt = (
-            "Kripto işlem filtresi. Web araması kullanma; yalnızca verilen veriyi değerlendir. "
-            f"Coin {c['symbol']} ({c['name']}), fiyat {c['price']:.8g} USD, 24s {c['change24']:+.2f}%, "
-            f"RSI {c['rsi']:.1f}, hacim {c['volume_ratio']:.2f}x, teknik {c['score']}/7. "
-            "Güçlü yükseliş yapısı ve makul risk varsa AL; aksi halde BEKLE. "
-            "Yalnızca şu JSON: "
-            '{"score":0,"decision":"AL|BEKLE","risk":"DÜŞÜK|ORTA|YÜKSEK",'
-            '"summary":"en fazla 2 kısa Türkçe cümle","positive":[],"negative":[]}'
+            "Kripto AL filtresi. Web araması yapma; sadece verilen teknik veriyi değerlendir. "
+            "Her coin için 0-100 skor ver. Güçlü teknik yapı ve makul risk varsa AL, aksi halde BEKLE. "
+            "Yalnızca JSON döndür: {\"reviews\":[{\"symbol\":\"...\",\"score\":0,\"decision\":\"AL|BEKLE\",\"risk\":\"DÜŞÜK|ORTA|YÜKSEK\",\"summary\":\"kısa Türkçe\"}]}\n"
+            + json.dumps(items, ensure_ascii=False, separators=(",", ":"))
         )
         payload = {
             "model": self.ai_fallback_model,
@@ -336,7 +371,7 @@ class TradingBot:
                 {"role": "system", "content": "Türkçe yanıt ver. Sadece geçerli JSON döndür."},
                 {"role": "user", "content": prompt}
             ],
-            "max_completion_tokens": 300,
+            "max_completion_tokens": 700,
             "temperature": 0.1,
             "response_format": {"type": "json_object"}
         }
@@ -345,19 +380,23 @@ class TradingBot:
             "Content-Type": "application/json"
         }, timeout=45)
         parsed, _ = self._parse_ai_message(data)
-        result = self._compact_ai_result(parsed)
-        result["summary"] = (result["summary"] + " • Web araştırması yedek AI ile atlandı.").strip()
-        return result
+        out = {}
+        for item in (parsed.get("reviews") or []):
+            if not isinstance(item, dict) or not item.get("symbol"):
+                continue
+            out[item["symbol"]] = self._compact_ai_result(item)
+            out[item["symbol"]]["fallback"] = True
+            out[item["symbol"]]["fallback_reason"] = str(failure_text)[:220]
+            out[item["symbol"]]["summary"] += " • Yedek AI kullanıldı; web doğrulaması yapılmadı."
+        return out
 
     def ai_research(self, candidates):
+        """One Groq call per scan, not one call per coin.
+        Compound Mini performs at most one built-in tool call per request, so the
+        batch prompt asks for a single combined market/news check for all candidates.
         """
-        V15: Compound Mini önce çok küçük bir web araştırması yapar. 413/400/422
-        gibi model/tool kaynaklı hatalarda işlem tamamen kilitlenmez; küçük bir
-        text-only GPT-OSS 20B JSON çağrısına düşer. Böylece AI servisi geçici
-        olarak sorun çıkarsa panel sonsuza kadar 'Yeni işlem açılmadı' durumunda
-        kalmaz. Fallback web doğrulaması yapmaz, bu nedenle yüksek riskli bir
-        adayda yine teknik/AI kapısı korunur.
-        """
+        if not candidates:
+            return {}
         if not self.groq_key:
             msg = "GROQ_API_KEY yok. Render Environment Variables'a ekle."
             decision = "AI YOK" if self.allow_without_ai else "AI ONAYI GEREKLİ"
@@ -367,70 +406,108 @@ class TradingBot:
                 "positive": [], "negative": [], "sources": []
             } for c in candidates}
 
-        reviews = {}
         now_ts = time.time()
+        reviews = {}
+        fresh = []
         for c in candidates:
             cached = self.ai_reviews.get(c["symbol"])
             cached_at = self.last_ai_at.get(c["symbol"], 0)
             if cached and (now_ts - cached_at) < self.ai_cache_minutes * 60:
                 reviews[c["symbol"]] = cached
-                continue
+            else:
+                fresh.append(c)
 
-            prompt = (
-                "Kripto AL filtresi. Güncel web aramasıyla son 72 saatte yalnızca ciddi risk/katalizörleri kontrol et. "
-                f"Coin {c['symbol']} ({c['name']}), fiyat {c['price']:.8g} USD, 24s {c['change24']:+.2f}%, "
-                f"RSI5 {c['rsi']:.1f}, hacim5 {c['volume_ratio']:.2f}x, teknik {c['score']}/7. "
-                "Hack, exploit, delist, büyük unlock/arzdaki artış, ağ sorunu veya ciddi negatif haber varsa BEKLE. "
-                "Teknik yapı ve haber görünümü uygunsa AL. "
-                "Yalnızca şu JSON'u döndür: "
-                '{"score":0,"decision":"AL|BEKLE","risk":"DÜŞÜK|ORTA|YÜKSEK",'
-                '"summary":"en fazla 2 kısa Türkçe cümle","positive":["en fazla 2"],"negative":["en fazla 2"]}'
-            )
-            payload = {
-                "model": self.ai_model,
-                "messages": [
-                    {"role": "system", "content": "Türkçe yanıt ver. Sadece geçerli JSON döndür."},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_completion_tokens": 350,
-                "temperature": 0.1,
-                "compound_custom": {"tools": {"enabled_tools": ["web_search"]}}
-            }
-            try:
-                data = self._ai_request(payload, {
-                    "Authorization": f"Bearer {self.groq_key}",
-                    "Content-Type": "application/json",
-                    "Groq-Model-Version": "latest"
-                })
-                parsed, msg = self._parse_ai_message(data)
-                sources = []
-                for tool in (msg.get("executed_tools") or []):
-                    if not isinstance(tool, dict):
-                        continue
-                    for item in (tool.get("search_results") or [])[:3]:
+        if not fresh:
+            self.ai_batch_size = 0
+            self.last_groq_status = "AI önbelleği kullanıldı"
+            return reviews
+
+        if time.time() < self.groq_cooldown_until:
+            wait = max(1, int(self.groq_cooldown_until - time.time()))
+            self.last_ai_error = f"Groq 429 sonrası {wait} sn bekleniyor."
+            self.last_groq_status = self.last_ai_error
+            return reviews
+
+        self.ai_batch_size = len(fresh)
+        compact = [{
+            "symbol": c["symbol"], "name": c["name"],
+            "price": round(c["price"], 8), "change24": round(c["change24"], 2),
+            "rsi5": round(c["rsi"], 1), "volume5": round(c["volume_ratio"], 2),
+            "technical_score": c["score"]
+        } for c in fresh]
+        prompt = (
+            "Kripto alım öncesi risk araştırması yap. Aşağıdaki adayları TEK bir web aramasıyla "
+            "mümkün olduğunca güncel kontrol et. Son 72 saatte hack, exploit, delist, büyük unlock, "
+            "ağ sorunu, düzenleyici sorun veya ciddi negatif haber varsa o coini BEKLE. "
+            "Teknik verisi ve haber görünümü uygunsa AL. Her aday için 0-100 skor ver. "
+            "Sadece JSON döndür: {\"reviews\":[{\"symbol\":\"...\",\"score\":0,\"decision\":\"AL|BEKLE\",\"risk\":\"DÜŞÜK|ORTA|YÜKSEK\",\"summary\":\"en fazla 2 kısa Türkçe cümle\"}]}\n"
+            "ADAYLAR=" + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        )
+        payload = {
+            "model": self.ai_model,
+            "messages": [
+                {"role": "system", "content": "Türkçe yanıt ver. JSON dışında hiçbir şey döndürme."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_completion_tokens": 900,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "compound_custom": {"tools": {"enabled_tools": ["web_search"]}}
+        }
+        try:
+            data = self._ai_request(payload, {
+                "Authorization": f"Bearer {self.groq_key}",
+                "Content-Type": "application/json",
+                "Groq-Model-Version": "latest"
+            }, timeout=75)
+            parsed, msg = self._parse_ai_message(data)
+            sources = []
+            for tool in (msg.get("executed_tools") or []):
+                if not isinstance(tool, dict):
+                    continue
+                output = tool.get("output") or tool.get("search_results") or []
+                if isinstance(output, list):
+                    for item in output[:3]:
                         if isinstance(item, dict):
                             url = item.get("url") or item.get("link")
                             title = item.get("title") or item.get("name") or "Web kaynağı"
                             if url:
                                 sources.append({"title": str(title)[:120], "url": str(url)[:500]})
-                result = self._compact_ai_result(parsed, sources)
-                result["summary"] = result["summary"] or "Web araştırması tamamlandı."
+            parsed_items = {x.get("symbol"): x for x in (parsed.get("reviews") or []) if isinstance(x, dict) and x.get("symbol")}
+            for c in fresh:
+                item = parsed_items.get(c["symbol"], {"score": 0, "decision": "BEKLE", "risk": "ORTA", "summary": "AI bu adayı değerlendirmedi."})
+                result = self._compact_ai_result(item, sources)
                 reviews[c["symbol"]] = result
                 self.last_ai_at[c["symbol"]] = now_ts
                 self.ai_reviews[c["symbol"]] = result
-            except Exception as e:
-                # 413/400/422 dahil: küçük fallback çağrısı.
-                try:
-                    result = self._ai_fallback(c, str(e))
-                    result["fallback"] = True
-                    result["fallback_reason"] = str(e)[:220]
+            self.last_ai_error = None
+        except Exception as e:
+            self.last_ai_error = str(e)[:500]
+            # 429 is explicitly rate limiting. Do not make a second request.
+            if "HTTP 429" in str(e) or "rate limit" in str(e).lower():
+                for c in fresh:
+                    reviews[c["symbol"]] = {
+                        "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
+                        "summary": f"Groq rate limit: {e}. Bu taramada alım açılmadı.",
+                        "positive": [], "negative": [], "sources": []
+                    }
+                return reviews
+            try:
+                fallback = self._ai_fallback_batch(fresh, str(e))
+                for c in fresh:
+                    result = fallback.get(c["symbol"]) or {
+                        "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
+                        "summary": "Yedek AI sonuç üretmedi.", "positive": [], "negative": [], "sources": []
+                    }
                     reviews[c["symbol"]] = result
                     self.last_ai_at[c["symbol"]] = now_ts
                     self.ai_reviews[c["symbol"]] = result
-                except Exception as e2:
+            except Exception as e2:
+                self.last_ai_error = f"Ana AI: {e}; Yedek AI: {e2}"[:500]
+                for c in fresh:
                     reviews[c["symbol"]] = {
                         "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
-                        "summary": f"AI araştırması başarısız: {type(e).__name__}: {e}; yedek AI: {type(e2).__name__}: {e2}",
+                        "summary": f"AI araştırması başarısız: {self.last_ai_error}",
                         "positive": [], "negative": [], "sources": []
                     }
         return reviews
@@ -538,87 +615,100 @@ class TradingBot:
             except Exception as e:
                 self.last_error = f"Pozisyon yönetimi {symbol}: {type(e).__name__}: {e}"
 
-    def tick(self):
+    def tick(self, force=False):
         if not self.running:
             return
-        self.last_check = self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
-        self.last_error = None
-
-        try:
-            products = self.get_products()
-        except Exception as e:
-            self.last_error = f"Coin listesi alınamadı: {type(e).__name__}: {e}"
+        now = time.time()
+        if not force and now < self.next_scan_at:
             return
+        if not self.tick_lock.acquire(blocking=False):
+            self.last_trade_block_reason = "Tarama zaten çalışıyor; ikinci tarama engellendi."
+            return
+        try:
+            self.last_check = self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
+            self.last_check = self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
+            self.last_error = None
 
-        results = []
-        for product in products:
             try:
-                results.append(self.technical_analyze(product))
+                products = self.get_products()
             except Exception as e:
-                pass
+                self.last_error = f"Coin listesi alınamadı: {type(e).__name__}: {e}"
+                return
 
-        # Fırsat havuzu: eski 6/7 filtresi çok sertti ve 24 saat hiç işlem
-        # oluşmamasına yol açabiliyordu. Şimdi önce teknik olarak makul adayları
-        # sıralıyor, son kararı AI + risk filtresine bırakıyoruz.
-        results.sort(key=lambda x: (x["score"], x["core_score"], x["change24"], x["volume_ratio"]), reverse=True)
-        self.scanned_count = len(results)
+            results = []
+            for product in products:
+                try:
+                    results.append(self.technical_analyze(product))
+                except Exception as e:
+                    pass
 
-        eligible = [x for x in results if x["score"] >= 5 and x["core_score"] >= 4]
-        if len(eligible) < self.ai_candidates:
-            eligible = [x for x in results if x["score"] >= 4 and x["core_score"] >= 3]
-        candidates = eligible[:self.ai_candidates]
-        fresh_before = dict(self.last_ai_at)
-        self.ai_reviews = self.ai_research(candidates)
-        # Sayacı gerçekten araştırılan/yeni güncellenen adaylar için göster.
-        self.ai_review_count = sum(1 for c in candidates if self.last_ai_at.get(c["symbol"], 0) != fresh_before.get(c["symbol"], 0))
+            # Fırsat havuzu: eski 6/7 filtresi çok sertti ve 24 saat hiç işlem
+            # oluşmamasına yol açabiliyordu. Şimdi önce teknik olarak makul adayları
+            # sıralıyor, son kararı AI + risk filtresine bırakıyoruz.
+            results.sort(key=lambda x: (x["score"], x["core_score"], x["change24"], x["volume_ratio"]), reverse=True)
+            self.scanned_count = len(results)
 
-        # AI sonucu panelde tüm adaylarda görünür.
-        for x in results:
-            if x["symbol"] in self.ai_reviews:
-                x["ai"] = self.ai_reviews[x["symbol"]]
-            else:
-                x["ai"] = None
-            x["final_decision"] = (
-                "AL" if (x.get("ai") or {}).get("decision") == "AL"
+            eligible = [x for x in results if x["score"] >= 5 and x["core_score"] >= 4]
+            if len(eligible) < self.ai_candidates:
+                eligible = [x for x in results if x["score"] >= 4 and x["core_score"] >= 3]
+            candidates = eligible[:self.ai_candidates]
+            fresh_before = dict(self.last_ai_at)
+            self.ai_reviews = self.ai_research(candidates)
+            # Sayacı gerçekten araştırılan/yeni güncellenen adaylar için göster.
+            self.ai_review_count = sum(1 for c in candidates if self.last_ai_at.get(c["symbol"], 0) != fresh_before.get(c["symbol"], 0))
+
+            # AI sonucu panelde tüm adaylarda görünür.
+            for x in results:
+                if x["symbol"] in self.ai_reviews:
+                    x["ai"] = self.ai_reviews[x["symbol"]]
+                else:
+                    x["ai"] = None
+                x["final_decision"] = (
+                    "AL" if (x.get("ai") or {}).get("decision") == "AL"
+                    and (x.get("ai") or {}).get("score",0) >= self.ai_min_score
+                    else x["decision"]
+                )
+
+            self.signals = {x["symbol"]: x for x in results}
+
+            self.manage_positions()
+
+            # En yüksek teknik + AI skorlu adaylardan al.
+            ranked_buy = [
+                x for x in results
+                if x["decision"] == "AL ADAYI"
+                and (x.get("ai") or {}).get("decision") == "AL"
                 and (x.get("ai") or {}).get("score",0) >= self.ai_min_score
-                else x["decision"]
-            )
+                and (x.get("ai") or {}).get("risk") != "YÜKSEK"
+            ]
+            ranked_buy.sort(key=lambda x: ((x.get("ai") or {}).get("score",0), x["score"], x["change24"]), reverse=True)
 
-        self.signals = {x["symbol"]: x for x in results}
-
-        self.manage_positions()
-
-        # En yüksek teknik + AI skorlu adaylardan al.
-        ranked_buy = [
-            x for x in results
-            if x["decision"] == "AL ADAYI"
-            and (x.get("ai") or {}).get("decision") == "AL"
-            and (x.get("ai") or {}).get("score",0) >= self.ai_min_score
-            and (x.get("ai") or {}).get("risk") != "YÜKSEK"
-        ]
-        ranked_buy.sort(key=lambda x: ((x.get("ai") or {}).get("score",0), x["score"], x["change24"]), reverse=True)
-
-        if not ranked_buy:
-            ai_al = [x for x in results if (x.get("ai") or {}).get("decision") == "AL"]
-            if not ai_al:
-                self.last_trade_block_reason = f"Alım yok: AI {self.ai_min_score}+ skorlu AL adayı üretmedi."
+            if not ranked_buy:
+                ai_al = [x for x in results if (x.get("ai") or {}).get("decision") == "AL"]
+                if not ai_al:
+                    self.last_trade_block_reason = f"Alım yok: AI {self.ai_min_score}+ skorlu AL adayı üretmedi."
+                else:
+                    best = max((x.get("ai") or {}).get("score",0) for x in ai_al)
+                    self.last_trade_block_reason = f"Alım yok: en yüksek AI skoru {best}/100; gereken {self.ai_min_score}."
             else:
-                best = max((x.get("ai") or {}).get("score",0) for x in ai_al)
-                self.last_trade_block_reason = f"Alım yok: en yüksek AI skoru {best}/100; gereken {self.ai_min_score}."
-        else:
-            self.last_trade_block_reason = f"{len(ranked_buy)} uygun AL adayı bulundu; pozisyon açma denendi."
+                self.last_trade_block_reason = f"{len(ranked_buy)} uygun AL adayı bulundu; pozisyon açma denendi."
 
-        opened_count = 0
-        for s in ranked_buy:
-            if len(self.positions) >= self.max_positions or self.balance_try < self.min_buy_try:
-                self.last_trade_block_reason = "Alım sırası durdu: aktif sermaye veya bakiye sınırı."
-                break
-            if self.open_sim(s):
-                opened_count += 1
-        if opened_count:
-            self.last_trade_block_reason = f"{opened_count} sanal pozisyon açıldı."
+            opened_count = 0
+            for s in ranked_buy:
+                if len(self.positions) >= self.max_positions or self.balance_try < self.min_buy_try:
+                    self.last_trade_block_reason = "Alım sırası durdu: aktif sermaye veya bakiye sınırı."
+                    break
+                if self.open_sim(s):
+                    opened_count += 1
+            if opened_count:
+                self.last_trade_block_reason = f"{opened_count} sanal pozisyon açıldı."
 
-        self.last_scan_ms = int(time.time()*1000)
+            self.last_scan_ms = int(time.time()*1000)
+
+        finally:
+            self.next_scan_at = time.time() + self.scan_interval_seconds
+            self.last_scan_ms = int(time.time()*1000)
+            self.tick_lock.release()
 
     def status(self):
         self._reset_daily_stats()
@@ -649,6 +739,10 @@ class TradingBot:
             "scanned_count": self.scanned_count,
             "ai_review_count": self.ai_review_count,
             "last_check": self.last_check, "last_error": self.last_error, "trade_block_reason": self.last_trade_block_reason,
+            "last_ai_error": self.last_ai_error, "groq_status": self.last_groq_status,
+            "groq_cooldown_seconds": max(0, int(self.groq_cooldown_until - time.time())),
+            "last_ai_request_at": self.last_ai_request_at, "ai_batch_size": self.ai_batch_size,
+            "scan_interval_seconds": self.scan_interval_seconds,
             "settings": self.settings(),
             "data_source": self.data_source,
             "entry_logic": "Adaptif teknik filtre (>=5/7, trend+MACD, en az 1 üst zaman dilimi) + Groq AI web araştırması + AI onayı",

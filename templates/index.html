@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="tr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#09090c"><title>Yatırım Botu V15</title>
+<meta name="theme-color" content="#09090c"><title>Yatırım Botu V16</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#09090c;color:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,Arial}.wrap{max-width:780px;margin:auto;padding:20px 14px 35px}.head{display:flex;justify-content:space-between;align-items:center}.title{font-size:28px;font-weight:800}.sub{color:#8e8e93;font-size:13px;margin-top:3px}.card{background:#17171c;border:1px solid #2a2a31;border-radius:22px;padding:16px;margin:12px 0}.notice{background:#302611;color:#f2c96d;padding:12px;border-radius:14px;margin:14px 0;font-size:13px}.error{background:#3a1515;color:#ff938c;padding:12px;border-radius:14px;margin:10px 0;font-size:12px;word-break:break-word}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.metric{background:#202025;border-radius:16px;padding:13px}.label{font-size:11px;color:#999}.big{font-size:19px;font-weight:800;margin-top:5px}.row{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px;margin-top:9px}
@@ -12,9 +12,9 @@ input{width:100%;background:#24242a;border:1px solid #38383f;color:white;padding
 table{width:100%;border-collapse:collapse;font-size:11px}td{padding:8px 2px;border-bottom:1px solid #29292f}.r{text-align:right}.footer{text-align:center;color:#666;font-size:10px;margin-top:18px}
 @media(max-width:420px){.title{font-size:24px}.big{font-size:17px}}
 </style></head><body><div class="wrap">
-<div class="head"><div><div class="title">🤖 Yatırım Botu V15</div><div class="sub">Groq AI + güvenli web araştırmalı iPhone paneli</div></div><div id="state">...</div></div>
+<div class="head"><div><div class="title">🤖 Yatırım Botu V16</div><div class="sub">Groq AI + rate-limit kontrollü web araştırmalı iPhone paneli</div></div><div id="state">...</div></div>
 <div class="notice">🛡️ <b>DRY RUN</b> aktif. Gerçek para kullanılmıyor. 🧠 Groq AI + güncel web araştırması yalnızca teknik olarak güçlü adaylarda çalışıyor.</div>
-<div id="error"></div><div id="tradeReason" class="notice" style="display:none"></div>
+<div id="error"></div><div id="aiStatus" class="notice" style="display:none"></div><div id="tradeReason" class="notice" style="display:none"></div>
 <div class="card"><div class="grid">
 <div class="metric"><div class="label">Toplam sermaye</div><div class="big" id="bal">-</div></div><div class="metric"><div class="label">Toplam K/Z</div><div class="big" id="pnl">-</div></div>
 <div class="metric"><div class="label">Açık işlem</div><div class="big" id="op">0</div></div><div class="metric"><div class="label">Taranan coin</div><div class="big" id="scanned">0</div></div>
@@ -42,7 +42,7 @@ table{width:100%;border-collapse:collapse;font-size:11px}td{padding:8px 2px;bord
 </div><button class="scan" onclick="save()">Ayarları Kaydet ve Yeniden Tara</button></div>
 
 <div class="card"><div class="section">📜 İşlem Geçmişi</div><div id="hist">Henüz işlem yok.</div></div>
-<div class="footer">Tarama yaklaşık 60 sn • Panel 10 sn yenilenir • AI web araştırması API kullanımı/ücretlendirmesine tabi olabilir.</div>
+<div class="footer">Tarama varsayılan yaklaşık 10 dk • Panel 10 sn yenilenir • AI adayları tek toplu istekle değerlendirilir • 429 gelirse otomatik bekleme uygulanır.</div>
 </div>
 
 <script>
@@ -57,7 +57,7 @@ async function load(){
   op.textContent=d.positions.length; scanned.textContent=d.scanned_count; airev.textContent=d.ai_review_count;
   trtime.textContent=d.runtime.now_tr; runtime.textContent='Aktif süre: '+d.runtime.uptime_text+' • Oturum başlangıcı: '+d.runtime.started_at_tr;
   state.innerHTML='<span class="dot '+(d.running?'on':'off')+'"></span>'+(d.running?'AKTİF':'DURDURULDU');
-  error.innerHTML=d.last_error?'<div class="error">⚠️ '+d.last_error+'</div>':''; const tr=document.getElementById("tradeReason"); if(d.trade_block_reason){tr.style.display="block";tr.textContent="🧭 "+d.trade_block_reason}else{tr.style.display="none"}
+  error.innerHTML=d.last_error?'<div class="error">⚠️ '+d.last_error+'</div>':''; const ast=document.getElementById("aiStatus"); if(d.groq_cooldown_seconds>0){ast.style.display='block';ast.textContent='🧠 Groq rate limit koruması: '+d.groq_cooldown_seconds+' sn bekleniyor.'}else if(d.groq_status){ast.style.display='block';ast.textContent='🧠 AI: '+d.groq_status+' • Toplu aday: '+(d.ai_batch_size||0)}else{ast.style.display='none'} const tr=document.getElementById("tradeReason"); if(d.trade_block_reason){tr.style.display="block";tr.textContent="🧭 "+d.trade_block_reason}else{tr.style.display="none"}
   source.textContent='Veri: '+d.data_source;
   logic.textContent='Giriş: '+d.entry_logic+' • '+d.exit_logic;
 
