@@ -1,0 +1,27 @@
+V14 - GROQ 413 KESIN DUZELTME
+
+Sorun:
+Groq HTTP 413 = Request Entity Too Large.
+
+V14 çözümü:
+- Kısa AI promptu
+- Ham mum verisi gönderilmez
+- Aday başına küçük payload
+- Sadece web_search
+- Groq-Model-Version: 2025-07-23
+- Kısa JSON çıktı
+- 413 dahil gerçek hata mesajı panelde gösterilir
+
+Render:
+GROQ_API_KEY = gsk_...
+AI_MODEL = groq/compound-mini
+AI_CANDIDATES = 8
+AI_MIN_SCORE = 70
+AI_CACHE_MINUTES = 15
+ALLOW_WITHOUT_AI = false
+DRY_RUN = true
+
+Deploy:
+GitHub -> dosyaları değiştir -> Commit -> Render -> Manual Deploy -> Deploy latest commit.
+
+Panelde "Yatırım Botu V14" görünmelidir.
