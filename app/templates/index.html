@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Midas AI Trader v0.3</title>
+<style>
+body{margin:0;background:#eef1f5;color:#17202a;font-family:Arial,sans-serif}
+header{background:#0f172a;color:white;padding:22px 5%}main{max-width:1400px;margin:22px auto;padding:0 16px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:white;border-radius:14px;padding:18px;box-shadow:0 3px 14px #0001;margin-bottom:16px}
+.big{font-size:28px;font-weight:800}.muted{color:#667085;font-size:12px}.buy{color:#07883b;font-weight:700}.watch{color:#b06d00;font-weight:700}.wait{color:#68707d}.score{font-weight:800}
+table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #e7e9ee;text-align:left;font-size:12px}code{background:#eef2f7;padding:2px 5px;border-radius:5px}
+@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}table{display:block;overflow:auto;white-space:nowrap}}
+</style></head><body>
+<header><h1>📊 Midas AI Trader v0.3</h1><div>Teknik + Haber + AI + Backtest + Telegram</div></header>
+<main>
+<div class="grid">
+<div class="card"><div class="muted">Taranan</div><div class="big">{{count}}</div></div>
+<div class="card"><div class="muted">AL ADAYI</div><div class="big">{{good|length}}</div></div>
+<div class="card"><div class="muted">Telegram</div><div class="big">{{"🟢" if telegram else "⚪"}}</div></div>
+<div class="card"><div class="muted">En yüksek birleşik skor</div><div class="big">{{rows[0].combined_score if rows else 0}}</div></div>
+</div>
+
+<div class="card"><h2>🔥 En güçlü adaylar</h2>
+{% for r in good[:5] %}
+<p><b>{{r.symbol}}</b> · <span class="buy">{{r.combined_score}}/100</span>
+· teknik {{r.score}} · haber {{r.news.score if r.news else 0}}
+· AI {{r.ai.score if r.ai else 0}}
+· stop {{'%.4f'|format(r.stop)}} · hedef {{'%.4f'|format(r.target1)}}</p>
+{% else %}<p>Şu an tüm filtreleri geçen aday yok.</p>{% endfor %}</div>
+
+<div class="card"><h2>Tarama</h2>
+<table><tr><th>Varlık</th><th>Fiyat</th><th>Teknik</th><th>Haber</th><th>AI</th><th>Genel</th><th>Sinyal</th><th>Rejim</th><th>RSI</th><th>Stop</th><th>Hedef</th></tr>
+{% for r in rows %}<tr>
+<td><b>{{r.symbol}}</b></td><td>{{'%.4f'|format(r.price) if r.price is defined else '-'}}</td>
+<td>{{r.score if r.score is defined else '-'}}</td><td>{{r.news.score if r.news else '-'}}</td><td>{{r.ai.score if r.ai else '-'}}</td>
+<td class="score">{{r.combined_score}}</td>
+<td class="{% if r.signal=='AL ADAYI' %}buy{% elif r.signal=='İZLE' %}watch{% else %}wait{% endif %}">{{r.signal}}</td>
+<td>{{r.regime if r.regime is defined else '-'}}</td><td>{{'%.1f'|format(r.rsi) if r.rsi is defined else '-'}}</td>
+<td>{{'%.4f'|format(r.stop) if r.stop is defined else '-'}}</td><td>{{'%.4f'|format(r.target1) if r.target1 is defined else '-'}}</td>
+</tr>{% endfor %}</table></div>
+
+<div class="card"><h2>📰 Haber + AI</h2>
+<p>Haber kaynağı GDELT DOC 2.0. Haber skoru başlıklardan kural tabanlı sentiment ile çıkarılır. OpenAI anahtarı varsa ikinci değerlendirme katmanı kullanılır; yoksa yerel değerlendirme çalışır.</p>
+</div>
+
+<div class="card"><h2>📈 Gerçek backtest</h2>
+<p>Örnek: <code>/api/backtest/AAPL</code>. Backtest sinyal tarihinden sonraki veriyi kullanır; komisyon ve slippage dahildir. Geçmiş performans gelecek getiriyi garanti etmez.</p></div>
+
+<div class="card"><h2>⚠️ Güvenlik</h2>
+<p>Telegram token ve OpenAI anahtarı yalnızca <code>.env</code> dosyasında tutulmalıdır. Midas veya Midas Kripto'ya otomatik emir gönderilmez.</p></div>
+</main></body></html>

@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: midas-ai-trader
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: APP_HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /var/data
+      - key: SCAN_INTERVAL_MINUTES
+        value: "30"
+      - key: OPENAI_MODEL
+        value: gpt-5.6
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: BACKTEST_COMMISSION
+        value: "0.001"
+      - key: BACKTEST_SLIPPAGE
+        value: "0.0005"
+      - key: BACKTEST_HOLD_DAYS
+        value: "20"
+    disk:
+      name: midas-data
+      mountPath: /var/data
+      sizeGB: 1
