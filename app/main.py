@@ -13,9 +13,11 @@ from .telegram import configured, send_signal
 from .backtest import run
 from .db import init
 from .scanner import scan_all, build_item
+from .version import VERSION, BUILD
 
 BASE_DIR = Path(__file__).resolve().parent
-TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+TEMPLATE_DIR = BASE_DIR / "templates"
+TEMPLATES = Jinja2Templates(directory=str(TEMPLATE_DIR))
 SCAN_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
 
 async def scheduler_loop():
@@ -41,7 +43,7 @@ app = FastAPI(title="Midas AI Trader v0.4 Cloud", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "midas-ai-trader", "scan_interval_minutes": SCAN_MINUTES}
+    return {"ok": True, "service": "midas-ai-trader", "version": VERSION, "build": BUILD, "scan_interval_minutes": SCAN_MINUTES}
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):

@@ -31,3 +31,13 @@ Windows'ta `start.bat` çalıştırın. Tarayıcı: http://127.0.0.1:8000
 - Telegram bot tokenını paylaşmayın.
 - OpenAI API anahtarını paylaşmayın.
 - Bu sistem getiri garantisi vermez ve otomatik emir göndermez.
+
+
+## ÖNEMLİ: Render'da `app.py` görüyorsanız
+Bu paket Flask `app.py` kullanmaz. Ana uygulama `app/main.py` içindeki FastAPI uygulamasıdır.
+Render loglarında `/opt/render/project/src/app.py` veya `python app.py` görüyorsanız Render hâlâ eski GitHub/repository içeriğini deploy ediyordur.
+Bu paketin doğru başlangıç komutu:
+
+`uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+
+Doğru deploy sonrasında `/health` adresi JSON olarak `version: 0.4.1` ve `build: fastapi-render` döndürmelidir.
