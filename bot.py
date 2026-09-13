@@ -1,436 +1,415 @@
-import os, time, json, re, math, uuid, threading, hmac, hashlib
+import os, time, json, uuid, threading, hmac, hashlib
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from urllib.parse import urlencode
 
 import requests
 import pandas as pd
 import numpy as np
+
 try:
     import psycopg
 except ImportError:
     psycopg = None
 
-BINANCE_MAIN = "https://api.binance.com"
-BINANCE_TESTNET = "https://testnet.binance.vision"
-GROQ_CHAT = "https://api.groq.com/openai/v1/chat/completions"
-FX_URL = "https://api.frankfurter.app/latest"
-TR_ZONE = ZoneInfo("Europe/Istanbul")
+BINANCE_TR_BASE = os.getenv('BINANCE_TR_BASE', 'https://www.binance.tr').rstrip('/')
+BINANCE_MARKET_BASE = os.getenv('BINANCE_MARKET_BASE', 'https://api.binance.me').rstrip('/')
+GROQ_CHAT = 'https://api.groq.com/openai/v1/chat/completions'
+TR_ZONE = ZoneInfo('Europe/Istanbul')
 
 
 def money(v):
-    return round(float(v), 2)
-
+    try: return round(float(v), 2)
+    except Exception: return 0.0
 
 def dec_floor(value, increment):
-    v = Decimal(str(value)); inc = Decimal(str(increment))
+    v, inc = Decimal(str(value)), Decimal(str(increment))
     if inc <= 0: return float(v)
     return float((v / inc).to_integral_value(rounding=ROUND_DOWN) * inc)
 
-
-class BinanceClient:
-    """Binance Spot REST client using HMAC-SHA256 signed endpoints."""
+class BinanceTRClient:
     def __init__(self):
-        self.api_key = os.getenv("BINANCE_API_KEY", "").strip()
-        self.api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
-        self.testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
-        self.base = BINANCE_TESTNET if self.testnet else BINANCE_MAIN
-        self.timeout = int(os.getenv("BINANCE_HTTP_TIMEOUT", "15"))
-        self.recv_window = min(60000, max(1000, int(os.getenv("BINANCE_RECV_WINDOW", "5000"))))
+        self.api_key = os.getenv('BINANCE_API_KEY', '').strip()
+        self.api_secret = os.getenv('BINANCE_API_SECRET', '').strip()
+        self.timeout = max(5, int(os.getenv('BINANCE_HTTP_TIMEOUT', '20')))
+        self.recv_window = min(60000, max(1000, int(os.getenv('BINANCE_RECV_WINDOW', '5000'))))
         self.time_offset_ms = 0
-        self.exchange_info_cache = None
-        self.exchange_info_at = 0
 
     @property
     def configured(self):
         return bool(self.api_key and self.api_secret)
 
-    def _timestamp(self):
-        return int(time.time() * 1000) + self.time_offset_ms
+    def _encode(self, params):
+        from urllib.parse import urlencode
+        return urlencode([(k, v) for k, v in params.items() if v is not None], doseq=True)
 
-    def sync_time(self):
-        r = requests.get(self.base + "/api/v3/time", timeout=self.timeout)
-        r.raise_for_status()
-        server = int(r.json()["serverTime"])
-        self.time_offset_ms = server - int(time.time() * 1000)
-        return server
-
-    def _signed_params(self, params):
+    def _signed_params(self, params=None):
         p = dict(params or {})
-        p.setdefault("timestamp", self._timestamp())
-        p.setdefault("recvWindow", self.recv_window)
-        # Binance currently requires percent-encoding before HMAC for signed requests.
-        payload = urlencode(p, doseq=True, encoding="utf-8", safe="-_.~")
-        sig = hmac.new(self.api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-        p["signature"] = sig
+        p.setdefault('recvWindow', self.recv_window)
+        p['timestamp'] = int(time.time() * 1000) + self.time_offset_ms
+        query = self._encode(p)
+        p['signature'] = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         return p
 
-    def request(self, method, path, params=None, signed=False):
-        headers = {"User-Agent": "Coinbot-V21", "X-MBX-APIKEY": self.api_key} if self.api_key else {"User-Agent": "Coinbot-V21"}
-        p = self._signed_params(params) if signed else (params or {})
-        url = self.base + path
-        try:
-            r = requests.request(method, url, params=p, headers=headers, timeout=self.timeout)
-        except requests.RequestException as e:
-            raise RuntimeError(f"Binance ağ hatası: {e}")
+    def sync_time(self):
+        r = requests.get(BINANCE_TR_BASE + '/open/v1/common/time', timeout=self.timeout)
+        r.raise_for_status()
+        j = r.json()
+        if j.get('code', 0) != 0:
+            raise RuntimeError(j.get('msg', 'Binance server time error'))
+        self.time_offset_ms = int(j['timestamp']) - int(time.time() * 1000)
+        return j['timestamp']
+
+    def public(self, path, params=None, market=False):
+        base = BINANCE_MARKET_BASE if market else BINANCE_TR_BASE
+        r = requests.get(base + path, params=params or {}, timeout=self.timeout,
+                         headers={'User-Agent':'Coinbot-V22'})
         if not r.ok:
             try: detail = r.json()
             except Exception: detail = r.text
-            code = detail.get("code") if isinstance(detail, dict) else r.status_code
-            msg = detail.get("msg") if isinstance(detail, dict) else str(detail)
-            if r.status_code in (418, 429):
-                retry = r.headers.get("Retry-After", "?")
-                raise RuntimeError(f"Binance HTTP {r.status_code} / {code}: {msg} • Retry-After={retry}s")
-            raise RuntimeError(f"Binance HTTP {r.status_code} / {code}: {msg}")
-        try: return r.json()
-        except Exception: raise RuntimeError(f"Binance geçersiz JSON: {r.text[:500]}")
+            raise RuntimeError(f'Binance HTTP {r.status_code}: {str(detail)[:600]}')
+        j = r.json()
+        if isinstance(j, dict) and j.get('code', 0) not in (0, None):
+            raise RuntimeError(f"Binance API {j.get('code')}: {j.get('msg')}")
+        return j
 
-    def exchange_info(self, force=False):
-        if not force and self.exchange_info_cache and time.time() - self.exchange_info_at < 900:
-            return self.exchange_info_cache
-        data = self.request("GET", "/api/v3/exchangeInfo")
-        self.exchange_info_cache = data; self.exchange_info_at = time.time()
-        return data
+    def signed(self, method, path, params=None):
+        if not self.configured:
+            raise RuntimeError('BINANCE_API_KEY / BINANCE_API_SECRET eksik')
+        try:
+            self.sync_time()
+        except Exception:
+            pass
+        p = self._signed_params(params)
+        headers = {'X-MBX-APIKEY': self.api_key, 'User-Agent':'Coinbot-V22'}
+        if method.upper() == 'GET':
+            r = requests.get(BINANCE_TR_BASE + path, params=p, headers=headers, timeout=self.timeout)
+        else:
+            r = requests.post(BINANCE_TR_BASE + path, data=p, headers=headers, timeout=self.timeout)
+        if not r.ok:
+            try: detail = r.json()
+            except Exception: detail = r.text
+            raise RuntimeError(f'Binance TR HTTP {r.status_code}: {str(detail)[:800]}')
+        j = r.json()
+        if isinstance(j, dict) and j.get('code', 0) not in (0, None):
+            raise RuntimeError(f"Binance TR API {j.get('code')}: {j.get('msg') or j.get('message')}")
+        return j
 
-    def symbol_info(self, symbol):
-        for s in self.exchange_info().get("symbols", []):
-            if s.get("symbol") == symbol: return s
-        raise RuntimeError(f"Binance sembolü bulunamadı: {symbol}")
-
-    def ticker_24hr(self):
-        return self.request("GET", "/api/v3/ticker/24hr")
-
-    def klines(self, symbol, interval="5m", limit=200):
-        return self.request("GET", "/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": min(1000, limit)})
+    def symbols(self):
+        return self.public('/open/v1/common/symbols').get('data', {}).get('list', [])
 
     def account(self):
-        if not self.configured: raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET eksik")
-        return self.request("GET", "/api/v3/account", params={"omitZeroBalances": "true"}, signed=True)
+        return self.signed('GET', '/open/v1/account/spot').get('data', {})
 
-    def balance(self, asset):
-        for b in self.account().get("balances", []):
-            if b.get("asset") == asset:
-                return float(b.get("free", 0)) + float(b.get("locked", 0))
+    def try_available(self):
+        for a in self.account().get('accountAssets', []):
+            if a.get('asset') == 'TRY':
+                return float(a.get('free') or 0)
         return 0.0
 
-    def free_balance(self, asset):
-        for b in self.account().get("balances", []):
-            if b.get("asset") == asset: return float(b.get("free", 0))
-        return 0.0
+    def candles(self, symbol, interval='5m', limit=1000):
+        # Main (symbol type 1) market data is documented by Binance TR on api.binance.me.
+        # Symbols use the underscore-free MBX form for this endpoint.
+        market_symbol = symbol.replace('_', '')
+        j = self.public('/api/v1/klines', {'symbol': market_symbol, 'interval': interval, 'limit': min(1000, limit)}, market=True)
+        rows = j.get('data', j if isinstance(j, list) else [])
+        if not rows:
+            raise RuntimeError(f'{symbol}: mum verisi boş')
+        df = pd.DataFrame(rows, columns=['start','open','high','low','close','volume','close_time','quote_volume','trades','taker_base','taker_quote','ignore'])
+        for c in ['open','high','low','close','volume','quote_volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df['start'] = pd.to_numeric(df['start'], errors='coerce')
+        return df.dropna().sort_values('start').reset_index(drop=True)
 
-    def order(self, symbol, order_id=None, client_order_id=None):
-        p = {"symbol": symbol}
-        if order_id is not None: p["orderId"] = order_id
-        elif client_order_id: p["origClientOrderId"] = client_order_id
-        else: raise ValueError("orderId veya clientOrderId gerekli")
-        return self.request("GET", "/api/v3/order", params=p, signed=True)
+    def order_market_buy(self, symbol, quote_try):
+        return self.signed('POST', '/open/v1/orders', {
+            'symbol': symbol, 'side': 0, 'type': 2,
+            'quoteOrderQty': f'{quote_try:.2f}', 'clientId': 'CB-' + uuid.uuid4().hex[:20]
+        })
 
-    def create_market_buy(self, symbol, quote_qty, client_order_id):
-        p = {"symbol": symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": f"{quote_qty:.8f}", "newOrderRespType": "FULL", "newClientOrderId": client_order_id}
-        return self.request("POST", "/api/v3/order", params=p, signed=True)
+    def order_market_sell(self, symbol, qty):
+        return self.signed('POST', '/open/v1/orders', {
+            'symbol': symbol, 'side': 1, 'type': 2,
+            'quantity': f'{qty:.12f}', 'clientId': 'CB-' + uuid.uuid4().hex[:20]
+        })
 
-    def create_market_sell(self, symbol, quantity, client_order_id):
-        p = {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": f"{quantity:.12f}", "newOrderRespType": "FULL", "newClientOrderId": client_order_id}
-        return self.request("POST", "/api/v3/order", params=p, signed=True)
-
+    def order_detail(self, order_id=None, client_id=None):
+        p = {'orderId': order_id} if order_id is not None else {'clientId': client_id}
+        return self.signed('GET', '/open/v1/orders/detail', p).get('data', {})
 
 class TradingBot:
     def __init__(self):
-        self.lock = threading.Lock(); self.running = True; self.started_at = datetime.now(timezone.utc)
-        self.live_trading = os.getenv("LIVE_TRADING", "false").lower() == "true"
-        self.live_confirm = os.getenv("LIVE_CONFIRM", "") == "I_UNDERSTAND_REAL_MONEY_TRADING"
+        self.lock = threading.Lock(); self.running = True
+        self.started_at = datetime.now(timezone.utc)
+        self.live_trading = os.getenv('LIVE_TRADING','false').lower() == 'true'
+        self.live_confirm = os.getenv('LIVE_CONFIRM','').strip() == 'I_UNDERSTAND_REAL_MONEY_TRADING'
         self.dry_run = not (self.live_trading and self.live_confirm)
-        self.mode = "LIVE" if not self.dry_run else "DRY RUN"
-        self.quote_asset = os.getenv("QUOTE_ASSET", "USDT").upper()
-        self.balance_try = float(os.getenv("STARTING_TRY_BALANCE", "5000")); self.initial_balance = self.balance_try
-        self.realized_pnl = 0.0; self.fx_rate = None; self.fx_at = 0.0
-        self.risk = float(os.getenv("RISK_PER_TRADE", "0.01")); self.tp = float(os.getenv("TAKE_PROFIT", "0.025")); self.sl = float(os.getenv("STOP_LOSS", "0.01")); self.trailing = float(os.getenv("TRAILING_STOP", "0.01"))
-        self.min_buy_try = max(1000.0, float(os.getenv("MIN_BUY_TRY", "1000"))); self.min_loss_try = max(100.0, float(os.getenv("MIN_LOSS_TRY", "100"))); self.min_profit_try = max(150.0, float(os.getenv("MIN_PROFIT_TRY", "150")))
-        self.max_daily_loss_try = max(100.0, float(os.getenv("MAX_DAILY_LOSS_TRY", "200"))); self.max_consecutive_losses = max(1, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))); self.loss_cooldown_minutes = max(5, int(os.getenv("LOSS_COOLDOWN_MINUTES", "30")))
-        self.max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "20")); self.position_pct = min(.25, float(os.getenv("POSITION_SIZE_PCT", ".25"))); self.active_capital_pct = min(1., max(.05, float(os.getenv("ACTIVE_CAPITAL_PCT", ".75"))))
-        self.entry_score = max(4, int(os.getenv("ENTRY_SCORE", "4"))); self.scan_limit = min(60, max(10, int(os.getenv("SCAN_LIMIT", "40")))); self.ai_candidates = min(10, max(3, int(os.getenv("AI_CANDIDATES", "8")))); self.ai_min_score = min(100, max(50, int(os.getenv("AI_MIN_SCORE", "70"))))
-        self.ai_model = os.getenv("AI_MODEL", "openai/gpt-oss-20b"); self.ai_fallback_model = os.getenv("AI_FALLBACK_MODEL", "llama-3.1-8b-instant"); self.ai_cache_minutes = max(5, int(os.getenv("AI_CACHE_MINUTES", "15"))); self.allow_without_ai = os.getenv("ALLOW_WITHOUT_AI", "false").lower() == "true"; self.groq_key = os.getenv("GROQ_API_KEY", "").strip()
-        self.positions = {}; self.history = []; self.signals = {}; self.ai_reviews = {}; self.last_ai_at = {}; self.last_check = None; self.last_error = None; self.last_ai_error = None; self.last_trade_block_reason = "Henüz tarama yapılmadı."; self.scanned_count = 0; self.ai_review_count = 0; self.last_scan_ms = 0; self.next_scan_at = 0; self.scan_interval_seconds = max(120, int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))); self.groq_cooldown_until = 0; self.last_groq_status = "Hazır"; self.last_ai_request_at = None; self.ai_batch_size = 0; self.pending_symbols = set(); self.last_sell_at = {}; self.consecutive_losses = 0; self.cooldown_until = 0
-        self.trade_stats={"buy_count":0,"sell_count":0,"total_buy_try":0.,"total_sell_try":0.,"wins":0,"losses":0,"daily_realized_pnl":0.,"day":self.now_tr_date()}
-        self.bn = BinanceClient(); self._load_state()
-        if self.live_trading and not self.live_confirm: self.last_error="LIVE_TRADING=true ama LIVE_CONFIRM eksik; canlı emirler güvenlik nedeniyle kapalı."
-        if self.live_trading and not self.bn.configured: self.last_error="Canlı mod için BINANCE_API_KEY ve BINANCE_API_SECRET gerekli."
-        if self.live_trading and not self.database_url: self.last_error="Canlı mod için DATABASE_URL gerekli."
+        self.mode = 'LIVE' if not self.dry_run else 'DRY RUN'
+        self.initial_balance = float(os.getenv('STARTING_TRY_BALANCE','5000'))
+        self.balance_try = self.initial_balance
+        self.realized_pnl = 0.0
+        self.risk = float(os.getenv('RISK_PER_TRADE','0.01'))
+        self.tp = float(os.getenv('TAKE_PROFIT','0.025'))
+        self.sl = float(os.getenv('STOP_LOSS','0.01'))
+        self.trailing = float(os.getenv('TRAILING_STOP','0.01'))
+        self.min_buy_try = max(1000.0, float(os.getenv('MIN_BUY_TRY','1000')))
+        self.min_loss_try = max(100.0, float(os.getenv('MIN_LOSS_TRY','100')))
+        self.min_profit_try = max(150.0, float(os.getenv('MIN_PROFIT_TRY','150')))
+        self.max_daily_loss_try = max(100.0, float(os.getenv('MAX_DAILY_LOSS_TRY','200')))
+        self.max_consecutive_losses = max(1, int(os.getenv('MAX_CONSECUTIVE_LOSSES','3')))
+        self.loss_cooldown_minutes = max(5, int(os.getenv('LOSS_COOLDOWN_MINUTES','30')))
+        self.max_positions = max(1, min(20, int(os.getenv('MAX_OPEN_POSITIONS','20'))))
+        self.position_pct = min(.25, max(.01, float(os.getenv('POSITION_SIZE_PCT','0.25'))))
+        self.active_capital_pct = min(1.0, max(.05, float(os.getenv('ACTIVE_CAPITAL_PCT','0.75'))))
+        self.entry_score = max(4, min(5, int(os.getenv('ENTRY_SCORE','4'))))
+        self.scan_limit = min(60, max(10, int(os.getenv('SCAN_LIMIT','40'))))
+        self.ai_candidates = min(10, max(3, int(os.getenv('AI_CANDIDATES','8'))))
+        self.ai_min_score = min(100, max(50, int(os.getenv('AI_MIN_SCORE','70'))))
+        self.ai_model = os.getenv('AI_MODEL','llama-3.1-8b-instant').strip()
+        self.ai_fallback_model = os.getenv('AI_FALLBACK_MODEL','').strip()
+        self.groq_key = os.getenv('GROQ_API_KEY','').strip()
+        self.allow_without_ai = os.getenv('ALLOW_WITHOUT_AI','false').lower() == 'true'
+        self.scan_interval_seconds = max(120, int(os.getenv('SCAN_INTERVAL_SECONDS','300')))
+        self.positions={}; self.history=[]; self.signals={}; self.ai_reviews={}; self.last_ai_at={}
+        self.last_check=None; self.last_error=None; self.last_ai_error=None; self.last_trade_block_reason='Henüz tarama yapılmadı.'
+        self.last_groq_status='Hazır'; self.last_ai_request_at=None; self.ai_batch_size=0; self.scanned_count=0; self.ai_review_count=0
+        self.last_scan_ms=0; self.consecutive_losses=0; self.cooldown_until=0; self.pending_symbols=set(); self.next_scan_at=0
+        self.database_url=''; self.trade_stats={'buy_count':0,'sell_count':0,'total_buy_try':0.0,'total_sell_try':0.0,'wins':0,'losses':0,'daily_realized_pnl':0.0,'day':self.now_tr_date()}
+        self.binance = BinanceTRClient(); self._load_state()
+        if self.live_trading and not self.live_confirm: self.last_error='LIVE_TRADING=true ama LIVE_CONFIRM eksik; canlı emirler kapalı.'
+        if self.live_trading and not self.binance.configured: self.last_error='Canlı mod için BINANCE_API_KEY ve BINANCE_API_SECRET gerekli.'
+        if self.live_trading and not self.database_url: self.last_error='Canlı mod için DATABASE_URL gerekli.'
 
     def now_tr(self): return datetime.now(TR_ZONE)
     def now_tr_date(self): return self.now_tr().date().isoformat()
     def runtime(self):
         sec=max(0,int((datetime.now(timezone.utc)-self.started_at).total_seconds())); d,rem=divmod(sec,86400); h,rem=divmod(rem,3600); m,s=divmod(rem,60)
-        return {"uptime_text":f"{d} gün {h:02d} saat {m:02d} dk {s:02d} sn","started_at_tr":self.started_at.astimezone(TR_ZONE).strftime("%d.%m.%Y %H:%M:%S"),"now_tr":self.now_tr().strftime("%d.%m.%Y %H:%M:%S")}
+        return {'uptime_text':f'{d} gün {h:02d} saat {m:02d} dk {s:02d} sn','started_at_tr':self.started_at.astimezone(TR_ZONE).strftime('%d.%m.%Y %H:%M:%S'),'now_tr':self.now_tr().strftime('%d.%m.%Y %H:%M:%S')}
 
     def _load_state(self):
-        self.database_url=os.getenv("DATABASE_URL","").strip()
-        if not self.database_url or psycopg is None:
-            if self.live_trading: self.last_error="Canlı mod için DATABASE_URL gerekli."
-            return
+        self.database_url=os.getenv('DATABASE_URL','').strip()
+        if not self.database_url or psycopg is None: return
         try:
             with psycopg.connect(self.database_url) as conn:
                 with conn.cursor() as cur:
-                    cur.execute("CREATE TABLE IF NOT EXISTS bot_state_v21_binance (id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())")
-                    cur.execute("SELECT payload FROM bot_state_v21_binance WHERE id=1"); row=cur.fetchone()
+                    cur.execute('CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())')
+                    cur.execute('SELECT payload FROM bot_state WHERE id=1'); row=cur.fetchone()
                     if row:
-                        data=row[0]; self.positions=data.get("positions",{}); self.history=data.get("history",[]); self.trade_stats=data.get("trade_stats",self.trade_stats); self.realized_pnl=float(data.get("realized_pnl",0)); self.consecutive_losses=int(data.get("consecutive_losses",0)); self.cooldown_until=float(data.get("cooldown_until",0)); self.last_sell_at=data.get("last_sell_at",{}); self.initial_balance=float(data.get("initial_balance",self.initial_balance))
-        except Exception as e:
-            self.last_error=f"Veritabanı yükleme hatası: {type(e).__name__}: {e}"
+                        d=row[0] or {}; self.positions=d.get('positions',{}); self.history=d.get('history',[]); self.trade_stats.update(d.get('trade_stats',{})); self.realized_pnl=float(d.get('realized_pnl',0)); self.consecutive_losses=int(d.get('consecutive_losses',0)); self.cooldown_until=float(d.get('cooldown_until',0)); self.initial_balance=float(d.get('initial_balance',self.initial_balance))
+        except Exception as e: self.last_error=f'DB yükleme hatası: {type(e).__name__}: {e}'
 
     def _save_state(self):
         if not self.database_url or psycopg is None: return
-        payload={"positions":self.positions,"history":self.history[:100],"trade_stats":self.trade_stats,"realized_pnl":self.realized_pnl,"consecutive_losses":self.consecutive_losses,"cooldown_until":self.cooldown_until,"last_sell_at":self.last_sell_at,"initial_balance":self.initial_balance}
+        payload={'positions':self.positions,'history':self.history[:150],'trade_stats':self.trade_stats,'realized_pnl':self.realized_pnl,'consecutive_losses':self.consecutive_losses,'cooldown_until':self.cooldown_until,'initial_balance':self.initial_balance}
         try:
             with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur: cur.execute("CREATE TABLE IF NOT EXISTS bot_state_v21_binance (id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())"); cur.execute("INSERT INTO bot_state_v21_binance (id,payload) VALUES (1,%s) ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()",(json.dumps(payload,ensure_ascii=False),))
-        except Exception as e: self.last_error=f"Veritabanı kayıt hatası: {type(e).__name__}: {e}"
+                with conn.cursor() as cur:
+                    cur.execute('CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())')
+                    cur.execute('INSERT INTO bot_state (id,payload) VALUES (1,%s) ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload,updated_at=NOW()', (json.dumps(payload,ensure_ascii=False),))
+        except Exception as e: self.last_error=f'DB kayıt hatası: {type(e).__name__}: {e}'
 
-    def _reset_daily_stats(self):
+    def _reset_daily(self):
         today=self.now_tr_date()
-        if self.trade_stats.get("day")!=today:
-            self.trade_stats.update({"buy_count":0,"sell_count":0,"total_buy_try":0.,"total_sell_try":0.,"wins":0,"losses":0,"daily_realized_pnl":0.,"day":today}); self.consecutive_losses=0
+        if self.trade_stats.get('day') != today:
+            self.trade_stats.update({'buy_count':0,'sell_count':0,'total_buy_try':0.0,'total_sell_try':0.0,'wins':0,'losses':0,'daily_realized_pnl':0.0,'day':today}); self.consecutive_losses=0
 
     def settings(self):
-        return {"risk":self.risk,"tp":self.tp,"sl":self.sl,"trailing":self.trailing,"max_positions":self.max_positions,"position_pct":self.position_pct,"active_capital_pct":self.active_capital_pct,"entry_score":self.entry_score,"scan_limit":self.scan_limit,"min_buy_try":self.min_buy_try,"min_loss_try":self.min_loss_try,"min_profit_try":self.min_profit_try,"ai_candidates":self.ai_candidates,"ai_min_score":self.ai_min_score,"ai_model":self.ai_model,"ai_provider":"Groq • web kapalı","ai_cache_minutes":self.ai_cache_minutes,"scan_interval_seconds":self.scan_interval_seconds,"max_daily_loss_try":self.max_daily_loss_try,"max_consecutive_losses":self.max_consecutive_losses,"loss_cooldown_minutes":self.loss_cooldown_minutes,"live_trading":self.live_trading,"mode":self.mode,"binance_testnet":self.bn.testnet,"quote_asset":self.quote_asset}
+        return {'risk':self.risk,'tp':self.tp,'sl':self.sl,'trailing':self.trailing,'max_positions':self.max_positions,'position_pct':self.position_pct,'active_capital_pct':self.active_capital_pct,'entry_score':self.entry_score,'scan_limit':self.scan_limit,'min_buy_try':self.min_buy_try,'min_loss_try':self.min_loss_try,'min_profit_try':self.min_profit_try,'ai_candidates':self.ai_candidates,'ai_min_score':self.ai_min_score,'ai_model':self.ai_model,'ai_provider':'Groq • web kapalı','scan_interval_seconds':self.scan_interval_seconds,'max_daily_loss_try':self.max_daily_loss_try,'max_consecutive_losses':self.max_consecutive_losses,'loss_cooldown_minutes':self.loss_cooldown_minutes,'live_trading':self.live_trading,'mode':self.mode,'allow_without_ai':self.allow_without_ai}
 
     def update_settings(self,d):
-        for k,attr in [("risk","risk"),("tp","tp"),("sl","sl"),("trailing","trailing")]:
+        for k,a in [('risk','risk'),('tp','tp'),('sl','sl'),('trailing','trailing')]:
             if k in d:
                 v=float(d[k])/100
-                if not 0<v<=.25: raise ValueError(f"{k} % 0-25 arasında olmalı")
-                setattr(self,attr,v)
-        if "max_positions" in d:self.max_positions=max(1,min(20,int(d["max_positions"])))
-        if "position_pct" in d:self.position_pct=min(.25,max(.01,float(d["position_pct"])/100))
-        if "active_capital_pct" in d:self.active_capital_pct=min(1,max(.05,float(d["active_capital_pct"])/100))
-        if "entry_score" in d:self.entry_score=max(4,min(5,int(d["entry_score"])))
-        if "scan_limit" in d:self.scan_limit=max(10,min(60,int(d["scan_limit"])))
-        if "ai_candidates" in d:self.ai_candidates=max(3,min(10,int(d["ai_candidates"])))
-        if "ai_min_score" in d:self.ai_min_score=max(50,min(100,int(d["ai_min_score"])))
-        if "min_buy_try" in d:self.min_buy_try=max(1000,float(d["min_buy_try"]))
-        if "min_loss_try" in d:self.min_loss_try=max(100,float(d["min_loss_try"]))
-        if "min_profit_try" in d:self.min_profit_try=max(150,float(d["min_profit_try"]))
-
-    def get_fx(self):
-        if self.fx_rate and time.time()-self.fx_at<900:return self.fx_rate
-        try:
-            r=requests.get(self.bn.base+"/api/v3/ticker/price",params={"symbol":self.quote_asset+"TRY"},timeout=8)
-            if r.ok:
-                rate=float(r.json()["price"]); self.fx_rate=rate; self.fx_at=time.time(); return rate
-        except Exception: pass
-        fixed=os.getenv("USDTRY_RATE","").strip()
-        if fixed:
-            self.fx_rate=float(fixed);self.fx_at=time.time();return self.fx_rate
-        r=requests.get(FX_URL,params={"from":"USD","to":"TRY"},timeout=10);r.raise_for_status();rate=float(r.json()["rates"]["TRY"]);self.fx_rate=rate;self.fx_at=time.time();return rate
+                if not 0<v<=.25: raise ValueError(f'{k} % 0-25 arasında olmalı')
+                setattr(self,a,v)
+        if 'max_positions' in d:self.max_positions=max(1,min(20,int(d['max_positions'])))
+        if 'position_pct' in d:self.position_pct=min(.25,max(.01,float(d['position_pct'])/100))
+        if 'active_capital_pct' in d:self.active_capital_pct=min(1,max(.05,float(d['active_capital_pct'])/100))
+        if 'entry_score' in d:self.entry_score=max(4,min(5,int(d['entry_score'])))
+        if 'scan_limit' in d:self.scan_limit=max(10,min(60,int(d['scan_limit'])))
+        if 'ai_candidates' in d:self.ai_candidates=max(3,min(10,int(d['ai_candidates'])))
+        if 'ai_min_score' in d:self.ai_min_score=max(50,min(100,int(d['ai_min_score'])))
+        if 'min_buy_try' in d:self.min_buy_try=max(1000,float(d['min_buy_try']))
+        if 'min_loss_try' in d:self.min_loss_try=max(100,float(d['min_loss_try']))
+        if 'min_profit_try' in d:self.min_profit_try=max(150,float(d['min_profit_try']))
 
     def get_products(self):
-        info=self.bn.exchange_info(); tradable={s["symbol"]:s for s in info.get("symbols",[]) if s.get("status")=="TRADING" and s.get("quoteAsset")==self.quote_asset and s.get("isSpotTradingAllowed",True)}
-        tickers=self.bn.ticker_24hr(); out=[]
-        for t in tickers:
-            sym=t.get("symbol"); s=tradable.get(sym)
-            if not s: continue
-            try: price=float(t.get("lastPrice",0)); vol=float(t.get("quoteVolume",0)); chg=float(t.get("priceChangePercent",0))
-            except Exception: continue
-            if price<=0: continue
-            base=s.get("baseAsset","")
-            if base in {"USDT","USDC","BUSD","FDUSD","TUSD","USDP","DAI","USDS"}: continue
-            out.append({"symbol":sym,"volume24":vol,"change24":chg,"price":price,"name":base,"base":base,"filters":s.get("filters",[])})
-        out.sort(key=lambda x:x["volume24"],reverse=True); return out[:self.scan_limit]
-
-    def _candles_df(self,symbol,interval,limit=200):
-        rows=self.bn.klines(symbol,interval,limit); df=pd.DataFrame(rows,columns=["start","open","high","low","close","volume","close_time","quote_volume","trades","tb_base","tb_quote","ignore"])
-        for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-        return df.dropna().sort_values("start").reset_index(drop=True)
-
-    def calc_indicators(self,df):
-        df=df.copy(); df["ema20"]=df.close.ewm(span=20,adjust=False).mean(); df["ema50"]=df.close.ewm(span=50,adjust=False).mean(); delta=df.close.diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean(); rs=gain/loss.replace(0,np.nan); df["rsi"]=100-(100/(1+rs)); e12=df.close.ewm(span=12,adjust=False).mean(); e26=df.close.ewm(span=26,adjust=False).mean(); df["macd"]=e12-e26; df["macds"]=df.macd.ewm(span=9,adjust=False).mean(); df["v20"]=df.volume.rolling(20).mean(); return df
-
-    def timeframe_snapshot(self,symbol,interval):
-        df=self.calc_indicators(self._candles_df(symbol,interval,200)); x=df.iloc[-1]; return {"price":float(x.close),"ema20":float(x.ema20),"ema50":float(x.ema50),"rsi":float(x.rsi),"macd":float(x.macd),"macds":float(x.macds),"volume_ratio":float(x.volume/x.v20) if pd.notna(x.v20) and x.v20 else 0,"trend":bool(x.ema20>x.ema50)}
-
-    def technical_analyze(self,product):
-        sym=product["symbol"]; tf5=self.timeframe_snapshot(sym,"5m"); tf15=self.timeframe_snapshot(sym,"15m"); tf1h=self.timeframe_snapshot(sym,"1h")
-        rsi_ok=45<=tf5["rsi"]<=72; trend_ok=tf5["trend"]; macd_ok=tf5["macd"]>tf5["macds"]; volume_ok=tf5["volume_ratio"]>=.80; momentum_ok=product["change24"]>-2; tf15_ok=tf15["trend"] and tf15["macd"]>tf15["macds"]; tf1h_ok=tf1h["trend"] and tf1h["macd"]>tf1h["macds"]
-        checks={"5dk Trend":trend_ok,"5dk RSI":rsi_ok,"5dk MACD":macd_ok,"5dk Hacim":volume_ok,"24s Momentum":momentum_ok,"15dk Onay":tf15_ok,"1s Onay":tf1h_ok}; core=sum(checks[k] for k in ["5dk Trend","5dk RSI","5dk MACD","5dk Hacim","24s Momentum"]); score=core+int(tf15_ok)+int(tf1h_ok); buy=trend_ok and macd_ok and core>=max(4,self.entry_score) and score>=5 and (tf15_ok or tf1h_ok)
-        return {"symbol":sym,"name":product["name"],"price":tf5["price"],"rsi":tf5["rsi"],"change24":product["change24"],"volume_ratio":tf5["volume_ratio"],"score":score,"core_score":core,"checks":checks,"decision":"AL ADAYI" if buy else "BEKLE","tf5":tf5,"tf15":tf15,"tf1h":tf1h,"reasons":[f"5dk trend {'uygun' if trend_ok else 'zayıf'}",f"5dk RSI {tf5['rsi']:.1f}",f"5dk MACD {'pozitif' if macd_ok else 'negatif'}",f"5dk hacim {tf5['volume_ratio']:.2f}x",f"24s momentum {product['change24']:+.2f}%",f"15dk {'onay' if tf15_ok else 'onay yok'}",f"1s {'onay' if tf1h_ok else 'onay yok'}"],"time":self.now_tr().strftime("%H:%M:%S")}
-
-    def _compact_ai_result(self,parsed):
-        parsed=parsed if isinstance(parsed,dict) else {}; raw_score=parsed.get("score",0)
-        try: score=max(0,min(100,int(float(raw_score))))
-        except Exception: score=0
-        decision=str(parsed.get("decision","BEKLE")).upper(); risk=str(parsed.get("risk","ORTA")).upper(); decision=decision if decision in ("AL","BEKLE") else "BEKLE"; risk=risk if risk in ("DÜŞÜK","ORTA","YÜKSEK") else "ORTA"
-        return {"score":score,"decision":decision,"risk":risk,"summary":str(parsed.get("summary",""))[:400],"positive":[] ,"negative":[],"sources":[]}
-
-    def _ai_request(self,model,prompt):
-        if time.time()<self.groq_cooldown_until: raise RuntimeError("Groq cooldown")
-        self.last_ai_request_at=self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
-        payload={"model":model,"messages":[{"role":"system","content":"Türkçe yanıt ver. Sadece geçerli JSON nesnesi üret. Şu formatı kullan: {\"reviews\":[{\"symbol\":\"BTCUSDT\",\"score\":0,\"decision\":\"AL\",\"risk\":\"DÜŞÜK\",\"summary\":\"kısa\"}]}"},{"role":"user","content":prompt}],"max_completion_tokens":900,"temperature":0.1,"response_format":{"type":"json_object"}}
-        r=requests.post(GROQ_CHAT,headers={"Authorization":f"Bearer {self.groq_key}","Content-Type":"application/json"},json=payload,timeout=35)
-        if not r.ok:
-            try: detail=(r.json().get("error") or {}).get("message",r.text)
-            except Exception: detail=r.text
-            if r.status_code==429:self.groq_cooldown_until=time.time()+60
-            raise RuntimeError(f"Groq HTTP {r.status_code}: {str(detail)[:500]}")
-        self.last_groq_status=f"200 OK • {model}"; return r.json()
-
-    def _extract_ai_json(self,data):
-        if not isinstance(data,dict): raise RuntimeError("Groq yanıtı nesne değil")
-        choices=data.get("choices")
-        if not isinstance(choices,list) or not choices or not isinstance(choices[0],dict): raise RuntimeError(f"Groq choices alanı geçersiz: {str(data)[:500]}")
-        msg=choices[0].get("message")
-        if not isinstance(msg,dict): raise RuntimeError(f"Groq message alanı geçersiz: {str(choices[0])[:500]}")
-        content=msg.get("content")
-        if not isinstance(content,str) or not content.strip(): raise RuntimeError("Groq boş content döndürdü")
-        text=content.strip(); m=re.search(r"\{.*\}",text,re.S)
-        try: parsed=json.loads(m.group(0) if m else text)
-        except Exception as e: raise RuntimeError(f"Groq JSON ayrıştırılamadı: {e}")
-        if not isinstance(parsed,dict) or not isinstance(parsed.get("reviews"),list): raise RuntimeError("Groq JSON içinde reviews listesi yok")
-        return parsed
-
-    def ai_research(self,candidates):
-        if not candidates:return {}
-        if not self.groq_key:
-            msg="GROQ_API_KEY yok. AI zorunlu olduğu için yeni alım açılmadı." if not self.allow_without_ai else "GROQ_API_KEY yok; teknik mod izinli."
-            return {c["symbol"]:{"score":0,"decision":"BEKLE","risk":"Bilinmiyor","summary":msg,"positive":[],"negative":[],"sources":[]} for c in candidates}
-        compact=[{"symbol":c["symbol"],"price":round(c["price"],8),"change24":round(c["change24"],2),"rsi":round(c["rsi"],1),"volume_ratio":round(c["volume_ratio"],2),"technical_score":c["score"],"core_score":c["core_score"]} for c in candidates]
-        prompt="Kripto spot AL filtresi. Web kullanma. Sadece verilen teknik veriyi değerlendir. Her coin için skor 0-100, karar AL/BEKLE, risk DÜŞÜK/ORTA/YÜKSEK ve en fazla 160 karakter özet ver. Sadece JSON üret. Veri="+json.dumps(compact,ensure_ascii=False,separators=(",",":"))
-        self.ai_batch_size=len(candidates)
-        models=[self.ai_model]+([self.ai_fallback_model] if self.ai_fallback_model and self.ai_fallback_model!=self.ai_model else [])
-        last=None
-        for model in models:
+        items=self.binance.symbols(); out=[]; stable={'USDT','USDC','FDUSD','BUSD','USDS'}
+        for p in items:
             try:
-                parsed=self._extract_ai_json(self._ai_request(model,prompt)); items={x.get("symbol"):x for x in parsed.get("reviews",[]) if isinstance(x,dict) and x.get("symbol")}; out={}
-                for c in candidates:
-                    r=self._compact_ai_result(items.get(c["symbol"],{})); out[c["symbol"]]=r; self.ai_reviews[c["symbol"]]=r; self.last_ai_at[c["symbol"]]=time.time()
-                self.last_ai_error=None; return out
-            except Exception as e: last=str(e)
-        self.last_ai_error=last or "Bilinmeyen AI hatası"; self.last_groq_status="AI hatası"; return {c["symbol"]:{"score":0,"decision":"BEKLE","risk":"Bilinmiyor","summary":f"AI araştırması başarısız: {self.last_ai_error}","positive":[],"negative":[],"sources":[]} for c in candidates}
+                if p.get('type') != 1 or p.get('quoteAsset') != 'TRY' or not p.get('spotTradingEnable'): continue
+                base=p.get('baseAsset',''); sym=p.get('symbol','')
+                if not base or base in stable or not sym: continue
+                filters={x.get('filterType'):x for x in p.get('filters',[])}
+                out.append({'symbol':sym,'name':base,'base':base,'quote':'TRY','filters':filters})
+            except Exception: continue
+        # Rank TRY pairs by 24h quote volume when Binance market data exposes the ticker endpoint.
+        try:
+            import json as _json
+            syms=[x['symbol'].replace('_','') for x in out]
+            tj=self.binance.public('/api/v3/ticker/24hr', {'symbols': _json.dumps(syms, separators=(',',':'))}, market=True)
+            tickers=tj if isinstance(tj,list) else tj.get('data',[])
+            by={str(t.get('symbol','')):t for t in tickers if isinstance(t,dict)}
+            for x in out:
+                t=by.get(x['symbol'].replace('_',''),{})
+                x['volume24']=float(t.get('quoteVolume') or 0)
+                x['change24_ticker']=float(t.get('priceChangePercent') or 0)
+                x['last_price']=float(t.get('lastPrice') or 0)
+            out.sort(key=lambda x:(x.get('volume24',0), x.get('last_price',0)), reverse=True)
+        except Exception:
+            out.sort(key=lambda x:x['symbol'])
+        return out[:self.scan_limit]
 
-    def _can_live_trade(self):
-        if self.dry_run:return False,"DRY RUN"
-        if not self.live_trading or not self.live_confirm:return False,"Canlı işlem güvenlik onayı eksik"
-        if not self.bn.configured:return False,"BINANCE_API_KEY / BINANCE_API_SECRET eksik"
-        if not self.database_url:return False,"DATABASE_URL eksik"
-        return True,""
+    def fetch_candles(self,symbol,limit=1000): return self.binance.candles(symbol,'5m',limit)
 
-    def _filter_values(self,symbol):
-        info=self.bn.symbol_info(symbol); f={x.get("filterType"):x for x in info.get("filters",[])}; lot=f.get("LOT_SIZE",{}); market_lot=f.get("MARKET_LOT_SIZE",lot); notional=f.get("NOTIONAL",f.get("MIN_NOTIONAL",{}));
-        return {"base":info.get("baseAsset"),"quote":info.get("quoteAsset"),"step":float(market_lot.get("stepSize") or lot.get("stepSize") or 0),"min_qty":float(market_lot.get("minQty") or lot.get("minQty") or 0),"min_notional":float(notional.get("minNotional") or 0),"quote_order_qty_market_allowed":bool(info.get("quoteOrderQtyMarketAllowed",True))}
+    def indicators(self,df):
+        d=df.copy(); d['ema20']=d.close.ewm(span=20,adjust=False).mean(); d['ema50']=d.close.ewm(span=50,adjust=False).mean()
+        delta=d.close.diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean(); rs=gain/loss.replace(0,np.nan); d['rsi']=100-(100/(1+rs))
+        e12=d.close.ewm(span=12,adjust=False).mean(); e26=d.close.ewm(span=26,adjust=False).mean(); d['macd']=e12-e26; d['macds']=d.macd.ewm(span=9,adjust=False).mean(); d['v20']=d.volume.rolling(20).mean(); return d
 
-    def _buy_amount_quote(self):
-        fx=self.get_fx(); min_quote=self.min_buy_try/fx; free=self.bn.free_balance(self.quote_asset) if not self.dry_run else self.balance_try/fx; equity=free+sum(p.get("last",0)*p.get("qty",0) for p in self.positions.values()); active_budget=equity*self.active_capital_pct; active_used=sum(p.get("buy_quote",0) for p in self.positions.values()); remaining=max(0,active_budget-active_used); amount=min(free,equity*self.position_pct,remaining); return amount if amount+1e-9>=min_quote else 0.0
+    def snapshot(self,df):
+        x=df.iloc[-1]; vr=float(x.volume/x.v20) if pd.notna(x.v20) and x.v20 else 0.0
+        return {'price':float(x.close),'ema20':float(x.ema20),'ema50':float(x.ema50),'rsi':float(x.rsi) if pd.notna(x.rsi) else 50.0,'macd':float(x.macd),'macds':float(x.macds),'volume_ratio':vr,'trend':bool(x.ema20>x.ema50)}
+
+    def technical_analyze(self,p):
+        df=self.indicators(self.fetch_candles(p['symbol']))
+        if len(df)<120: raise RuntimeError('yetersiz mum verisi')
+        # Build 15m/1h from the same 5m feed, reducing API load and avoiding 120+ calls per scan.
+        ix=pd.to_datetime(df['start'],unit='ms',utc=True); r=df.set_index(ix)
+        a5=self.snapshot(df); r15=r.resample('15min').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna(); r1h=r.resample('1h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+        a15=self.snapshot(self.indicators(r15)); a1h=self.snapshot(self.indicators(r1h))
+        chg24=((a5['price']/float(df.iloc[max(0,len(df)-289)]['close']))-1)*100 if len(df)>289 else 0.0
+        core=sum([a5['trend'],45<=a5['rsi']<=70,a5['macd']>a5['macds'],a5['volume_ratio']>=.8,chg24>-2])
+        tf15=a15['trend'] and a15['macd']>a15['macds']; tf1h=a1h['trend'] and a1h['macd']>a1h['macds']; score=core+tf15+tf1h
+        buy=a5['trend'] and a5['macd']>a5['macds'] and core>=max(4,self.entry_score) and score>=5 and (tf15 or tf1h)
+        return {'symbol':p['symbol'],'name':p['name'],'price':a5['price'],'rsi':a5['rsi'],'change24':chg24,'volume_ratio':a5['volume_ratio'],'score':score,'core_score':core,'checks':{'5dk Trend':a5['trend'],'5dk RSI':45<=a5['rsi']<=70,'5dk MACD':a5['macd']>a5['macds'],'5dk Hacim':a5['volume_ratio']>=.8,'24s Momentum':chg24>-2,'15dk Onay':tf15,'1s Onay':tf1h},'decision':'AL ADAYI' if buy else 'BEKLE','tf5':a5,'tf15':a15,'tf1h':a1h,'reasons':[f"5dk trend {'uygun' if a5['trend'] else 'zayıf'}",f"RSI {a5['rsi']:.1f}",f"MACD {'pozitif' if a5['macd']>a5['macds'] else 'negatif'}",f"Hacim {a5['volume_ratio']:.2f}x",f"24s {chg24:+.2f}%",f"15dk {'onay' if tf15 else 'onay yok'}",f"1s {'onay' if tf1h else 'onay yok'}"], 'time':self.now_tr().strftime('%H:%M:%S')}
+
+    def _parse_ai(self,text):
+        try: return json.loads(text)
+        except Exception:
+            import re; m=re.search(r'\{.*\}',text or '',re.S)
+            if not m: raise ValueError('AI geçerli JSON döndürmedi')
+            return json.loads(m.group(0))
+
+    def _ai_request(self,payload,model=None):
+        if not self.groq_key: raise RuntimeError('GROQ_API_KEY yok')
+        payload=dict(payload); payload['model']=model or self.ai_model
+        r=requests.post(GROQ_CHAT,headers={'Authorization':'Bearer '+self.groq_key,'Content-Type':'application/json'},json=payload,timeout=45)
+        if not r.ok:
+            try: msg=r.json().get('error',{}).get('message',r.text)
+            except Exception: msg=r.text
+            raise RuntimeError(f'Groq HTTP {r.status_code}: {str(msg)[:700]}')
+        self.last_groq_status='200 OK'; return r.json()
+
+    def ai_research(self,cands):
+        if not cands: return {}
+        compact=[{'symbol':c['symbol'],'price':round(c['price'],6),'change24':round(c['change24'],2),'rsi':round(c['rsi'],1),'volume_ratio':round(c['volume_ratio'],2),'technical_score':c['score'],'core_score':c['core_score']} for c in cands]
+        prompt=('Kripto spot teknik filtre. Web kullanma. Yalnızca verilen veriyi değerlendir. Her sembol için 0-100 score, decision AL/BEKLE, risk DÜŞÜK/ORTA/YÜKSEK ve kısa summary üret. Sadece JSON döndür. Yapı: {"reviews":[{"symbol":"BTC_TRY","score":75,"decision":"AL","risk":"ORTA","summary":"..."}]}. Tüm sembolleri döndür. Veri:\n'+json.dumps(compact,ensure_ascii=False,separators=(',',':')))
+        payload={'messages':[{'role':'system','content':'Türkçe yanıt ver. Yalnızca geçerli JSON üret.'},{'role':'user','content':prompt}],'temperature':0.1,'max_completion_tokens':600,'response_format':{'type':'json_object'}}
+        self.ai_batch_size=len(cands); self.last_ai_request_at=self.now_tr().strftime('%d.%m.%Y %H:%M:%S')
+        try:
+            data=self._ai_request(payload); content=((data.get('choices') or [{}])[0].get('message') or {}).get('content',''); obj=self._parse_ai(content); items={x.get('symbol'):x for x in obj.get('reviews',[]) if isinstance(x,dict)}; out={}
+            for c in cands:
+                x=items.get(c['symbol'],{}); dec=x.get('decision','BEKLE') if x.get('decision') in ('AL','BEKLE') else 'BEKLE'; risk=x.get('risk','ORTA') if x.get('risk') in ('DÜŞÜK','ORTA','YÜKSEK') else 'ORTA';
+                try: sc=max(0,min(100,int(float(x.get('score',0)))))
+                except: sc=0
+                out[c['symbol']]={'score':sc,'decision':dec,'risk':risk,'summary':str(x.get('summary',''))[:300],'positive':[],'negative':[],'sources':[]}; self.last_ai_at[c['symbol']]=time.time()
+            self.last_ai_error=None; return out
+        except Exception as e:
+            self.last_ai_error=str(e)[:900]; self.last_groq_status='AI hatası'
+            return {c['symbol']:{'score':0,'decision':'AI HATASI','risk':'Bilinmiyor','summary':self.last_ai_error,'positive':[],'negative':[],'sources':[]} for c in cands}
+
+    def _available_try(self):
+        return self.binance.try_available() if not self.dry_run else self.balance_try
+
+    def _buy_amount_try(self):
+        available=self._available_try(); market_value=sum(float(p.get('last',p.get('entry',0)))*float(p.get('qty',0)) for p in self.positions.values()); equity=available+market_value; active_budget=equity*self.active_capital_pct; active_used=sum(float(p.get('buy_amount_try',0)) for p in self.positions.values()); remaining=max(0,active_budget-active_used); amount=min(available,equity*self.position_pct,remaining); return amount if amount>=self.min_buy_try else 0.0
 
     def _open(self,s):
-        symbol=s["symbol"]
+        symbol=s['symbol'];
         if symbol in self.positions or symbol in self.pending_symbols:return False
-        self._reset_daily_stats()
-        if self.trade_stats["daily_realized_pnl"]<=-self.max_daily_loss_try or time.time()<self.cooldown_until or self.consecutive_losses>=self.max_consecutive_losses:return False
+        self._reset_daily()
+        if self.trade_stats['daily_realized_pnl']<=-self.max_daily_loss_try:return False
+        if time.time()<self.cooldown_until:return False
+        if self.consecutive_losses>=self.max_consecutive_losses:return False
         ai=self.ai_reviews.get(symbol,{})
-        if not (ai.get("decision")=="AL" and int(ai.get("score",0))>=self.ai_min_score and ai.get("risk")!="YÜKSEK") and not self.allow_without_ai:return False
-        amount=self._buy_amount_quote()
-        if amount<=0:return False
-        fx=self.get_fx(); buy_try=amount*fx; self.pending_symbols.add(symbol)
+        if not self.allow_without_ai and (ai.get('decision')!='AL' or ai.get('score',0)<self.ai_min_score): return False
+        amount=self._buy_amount_try()
+        if amount<self.min_buy_try: self.last_trade_block_reason=f'Alım yok: minimum {self.min_buy_try:.0f} TL veya aktif sermaye limiti nedeniyle yeterli bakiye yok.'; return False
+        self.pending_symbols.add(symbol)
         try:
             if self.dry_run:
-                price=s["price"]; qty=amount/max(price,1e-12); filled_value=amount; fee=0; order_id="SIM-"+uuid.uuid4().hex[:12]
+                price=s['price']; qty=amount/max(price,1e-12); order_id='SIM-'+uuid.uuid4().hex[:12]; fee=0.0; filled=amount
             else:
-                flt=self._filter_values(symbol)
-                if not flt["quote_order_qty_market_allowed"]: raise RuntimeError(f"{symbol}: Binance quoteOrderQty ile market alışa izin vermiyor")
-                if amount<flt["min_notional"]: raise RuntimeError(f"{symbol}: minimum notional {flt['min_notional']} {self.quote_asset}")
-                cid="CBOT"+uuid.uuid4().hex[:20]
-                try: resp=self.bn.create_market_buy(symbol,amount,cid)
-                except Exception as first:
-                    # If Binance returned a 5xx/timeout, query the client order id before assuming failure.
-                    try: resp=self.bn.order(symbol,client_order_id=cid)
-                    except Exception: raise first
-                order_id=str(resp.get("orderId") or resp.get("clientOrderId") or cid)
-                order=resp
-                if str(order.get("status","")).upper() not in {"FILLED","PARTIALLY_FILLED"} or not order.get("executedQty"):
-                    for _ in range(10):
-                        time.sleep(.7); order=self.bn.order(symbol,order_id=resp.get("orderId")) if resp.get("orderId") else self.bn.order(symbol,client_order_id=cid)
-                        if str(order.get("status","")).upper() in {"FILLED","CANCELED","REJECTED","EXPIRED"}:break
-                qty=float(order.get("executedQty") or 0); filled_value=float(order.get("cummulativeQuoteQty") or 0); fee=sum(float(x.get("commission",0)) for x in order.get("fills",[]) if x.get("commissionAsset")==self.quote_asset)
-                if qty<=0 or filled_value<=0: raise RuntimeError(f"Alış gerçekleşmedi: status={order.get('status')} {order.get('msg','')}")
-                price=filled_value/qty; buy_try=(filled_value+fee)*fx
-            self.positions[symbol]={"symbol":symbol,"name":s["name"],"entry":price,"qty":qty,"buy_quote":filled_value+fee,"buy_usd":filled_value+fee,"buy_amount_try":buy_try,"last":price,"unrealized":0,"peak_pnl":0,"ai_score":ai.get("score",0),"ai_risk":ai.get("risk",""),"opened":self.now_tr().strftime("%d.%m.%Y %H:%M:%S"),"order_id":order_id,"fee_quote":fee,"fx_rate":fx}
-            self.trade_stats["buy_count"]+=1; self.trade_stats["total_buy_try"]+=buy_try; self.history.insert(0,{"type":"OPEN","symbol":symbol,"price":price,"qty":qty,"buy_try":buy_try,"sell_try":None,"pnl":0,"reason":f"AL • Teknik {s['score']}/7 • AI {ai.get('score',0)}/100 • {self.mode}","time":self.now_tr().strftime("%d.%m.%Y %H:%M:%S"),"order_id":order_id}); self._save_state(); return True
+                resp=self.binance.order_market_buy(symbol,amount); oid=(resp.get('data') or {}).get('orderId');
+                if not oid: raise RuntimeError(str(resp))
+                time.sleep(.5); order=self.binance.order_detail(order_id=oid); status=int(order.get('status',0)); qty=float(order.get('executedQty') or 0); filled=float(order.get('executedQuoteQty') or 0); price=float(order.get('executedPrice') or 0); fee=0.0
+                if qty<=0 or status not in (1,2): raise RuntimeError(f'Emir dolmadı: status={status}')
+                if price<=0: price=filled/qty
+                order_id=str(oid)
+            self.positions[symbol]={'symbol':symbol,'name':s['name'],'entry':price,'qty':qty,'buy_amount_try':filled,'last':price,'unrealized':0.0,'peak_pnl':0.0,'peak_price':price,'ai_score':ai.get('score',0),'ai_risk':ai.get('risk',''),'opened':self.now_tr().strftime('%d.%m.%Y %H:%M:%S'),'order_id':order_id,'fee_try':fee}
+            self.trade_stats['buy_count']+=1; self.trade_stats['total_buy_try']+=filled; self.history.insert(0,{'type':'OPEN','symbol':symbol,'price':price,'qty':qty,'buy_try':filled,'sell_try':None,'pnl':0,'reason':f"AL • Teknik {s['score']}/7 • AI {ai.get('score',0)}/100 • {self.mode}",'time':self.now_tr().strftime('%d.%m.%Y %H:%M:%S'),'order_id':order_id}); self._save_state(); self.last_trade_block_reason=f"{'Canlı' if not self.dry_run else 'Sanal'} alım açıldı: {symbol} • {filled:.2f} TL"; return True
         finally:self.pending_symbols.discard(symbol)
 
     def _close(self,symbol,p,reason):
-        fx=self.get_fx(); price=float(p.get("last") or p.get("entry") or 0); qty=float(p.get("qty") or 0); oid=""
-        if qty<=0: raise RuntimeError(f"{symbol}: satış miktarı geçersiz")
+        price=float(p.get('last',p.get('entry',0))); qty=float(p.get('qty',0)); buy=float(p.get('buy_amount_try',0))
+        if qty<=0: raise RuntimeError(f'{symbol}: geçersiz satış miktarı')
         if not self.dry_run:
-            flt=self._filter_values(symbol); qty=dec_floor(qty,flt["step"])
-            if qty<flt["min_qty"]: raise RuntimeError(f"{symbol}: satış miktarı minQty altında")
-            if qty*price<flt["min_notional"]: raise RuntimeError(f"{symbol}: satış notional minNotional altında")
-            cid="CBOT"+uuid.uuid4().hex[:20]
-            try: resp=self.bn.create_market_sell(symbol,qty,cid)
-            except Exception as first:
-                try: resp=self.bn.order(symbol,client_order_id=cid)
-                except Exception: raise first
-            oid=str(resp.get("orderId") or resp.get("clientOrderId") or cid); order=resp
-            if str(order.get("status","")).upper() not in {"FILLED","PARTIALLY_FILLED"}:
-                for _ in range(10):
-                    time.sleep(.7); order=self.bn.order(symbol,order_id=resp.get("orderId")) if resp.get("orderId") else self.bn.order(symbol,client_order_id=cid)
-                    if str(order.get("status","")).upper() in {"FILLED","CANCELED","REJECTED","EXPIRED"}:break
-            filled=float(order.get("executedQty") or 0); value=float(order.get("cummulativeQuoteQty") or 0); fee=sum(float(x.get("commission",0)) for x in order.get("fills",[]) if x.get("commissionAsset")==self.quote_asset)
-            if filled<=0 or value<=0: raise RuntimeError(f"Satış gerçekleşmedi: status={order.get('status')} {order.get('msg','')}")
-            qty=filled; price=value/filled; sell_quote=value-fee; sell_try=sell_quote*fx
-        else:
-            sell_quote=price*qty; sell_try=sell_quote*fx; fee=0; oid="SIM-"+uuid.uuid4().hex[:12]
-        pnl=sell_try-p["buy_amount_try"]; self.trade_stats["sell_count"]+=1; self.trade_stats["total_sell_try"]+=sell_try; self.trade_stats["daily_realized_pnl"]+=pnl; self.realized_pnl+=pnl
-        if pnl>0:self.trade_stats["wins"]+=1;self.consecutive_losses=0
-        elif pnl<0:self.trade_stats["losses"]+=1;self.consecutive_losses+=1;self.cooldown_until=time.time()+self.loss_cooldown_minutes*60 if self.consecutive_losses>=self.max_consecutive_losses else 0
-        self.history.insert(0,{"type":"CLOSE","symbol":symbol,"price":price,"qty":qty,"buy_try":p["buy_amount_try"],"sell_try":sell_try,"pnl":pnl,"reason":reason,"time":self.now_tr().strftime("%d.%m.%Y %H:%M:%S"),"order_id":oid,"fee_quote":fee}); self.last_sell_at[symbol]=time.time(); del self.positions[symbol]; self._save_state()
+            # Re-read balance so a dust/fee-adjusted quantity cannot create a rejected sell.
+            asset=symbol.split('_')[0]; actual=self.binance.signed('GET','/open/v1/account/spot/asset',{'asset':asset}).get('data',{}); free=float(actual.get('free') or 0); qty=min(qty,free)
+            f=self.binance.symbols(); meta=next((x for x in f if x.get('symbol')==symbol),{}); filt={x.get('filterType'):x for x in meta.get('filters',[])}; step=float((filt.get('LOT_SIZE') or {}).get('stepSize') or '0.00000001'); minq=float((filt.get('LOT_SIZE') or {}).get('minQty') or '0'); qty=dec_floor(qty,step)
+            if qty<minq: raise RuntimeError(f'{symbol}: satış miktarı LOT_SIZE altında')
+            resp=self.binance.order_market_sell(symbol,qty); oid=(resp.get('data') or {}).get('orderId');
+            if not oid: raise RuntimeError(str(resp))
+            time.sleep(.5); order=self.binance.order_detail(order_id=oid); sold_qty=float(order.get('executedQty') or 0); sold_value=float(order.get('executedQuoteQty') or 0); price=float(order.get('executedPrice') or price); qty=sold_qty; sell_value=sold_value
+        else: sell_value=price*qty; oid='SIM-'+uuid.uuid4().hex[:12]
+        pnl=sell_value-buy; self.realized_pnl+=pnl; self.trade_stats['sell_count']+=1; self.trade_stats['total_sell_try']+=sell_value; self.trade_stats['daily_realized_pnl']+=pnl
+        if pnl>=0:self.trade_stats['wins']+=1; self.consecutive_losses=0
+        else:self.trade_stats['losses']+=1; self.consecutive_losses+=1; self.cooldown_until=time.time()+self.loss_cooldown_minutes*60
+        self.history.insert(0,{'type':'CLOSE','symbol':symbol,'price':price,'qty':qty,'buy_try':buy,'sell_try':sell_value,'pnl':pnl,'reason':reason,'time':self.now_tr().strftime('%d.%m.%Y %H:%M:%S'),'order_id':oid}); self.positions.pop(symbol,None); self._save_state()
 
     def manage_positions(self):
         for symbol,p in list(self.positions.items()):
             try:
-                product={"symbol":symbol,"name":p.get("name",symbol),"change24":0}; s=self.technical_analyze(product); p["last"]=s["price"]; p["peak_price"]=max(float(p.get("peak_price",p["entry"])),p["last"]); value=p["last"]*p["qty"]; pnl=(value-p.get("buy_quote",p.get("buy_usd",0)))*self.get_fx(); p["unrealized"]=pnl; p["peak_pnl"]=max(float(p.get("peak_pnl",0)),pnl); loss=pnl<=-self.min_loss_try; profit=pnl>=self.min_profit_try; trailing=p["peak_pnl"]>=self.min_profit_try and pnl<=p["peak_pnl"]*(1-self.trailing)
-                if loss:self._close(symbol,p,f"ZARAR EŞİĞİ (-{self.min_loss_try:.0f} TL)")
-                elif profit or trailing:self._close(symbol,p,f"KÂR/TRAILING (+{pnl:.0f} TL)")
-            except Exception as e:self.last_error=f"Pozisyon yönetimi {symbol}: {type(e).__name__}: {e}"
+                s=self.technical_analyze({'symbol':symbol,'name':p.get('name',symbol)}); p['last']=s['price']; p['peak_price']=max(float(p.get('peak_price',p['entry'])),p['last']); pnl=(p['last']*p['qty']-p['buy_amount_try']); p['unrealized']=pnl; p['peak_pnl']=max(float(p.get('peak_pnl',0)),pnl)
+                if pnl<=-self.min_loss_try:self._close(symbol,p,f'ZARAR EŞİĞİ (-{self.min_loss_try:.0f} TL)')
+                elif pnl>=self.min_profit_try:self._close(symbol,p,f'KÂR HEDEFİ (+{pnl:.0f} TL)')
+                elif p['peak_pnl']>=self.min_profit_try and pnl<=p['peak_pnl']*(1-self.trailing):self._close(symbol,p,f'TRAILING (+{pnl:.0f} TL)')
+            except Exception as e:self.last_error=f'Pozisyon yönetimi {symbol}: {type(e).__name__}: {e}'
 
     def tick(self,force=False):
-        if not self.running:return
-        if not force and time.time()<self.next_scan_at:return
-        if not self.lock.acquire(blocking=False):return
+        if not self.running or (not force and time.time()<self.next_scan_at) or not self.lock.acquire(blocking=False): return
         try:
-            self.last_check=self.now_tr().strftime("%d.%m.%Y %H:%M:%S"); self.last_error=None; self._reset_daily_stats()
-            if self.live_trading and not self.bn.configured:self.last_error="Binance API anahtarı eksik"; return
-            try: products=self.get_products()
-            except Exception as e:self.last_error=f"Binance coin listesi alınamadı: {type(e).__name__}: {e}"; return
-            results=[]
-            for product in products:
-                try: results.append(self.technical_analyze(product))
-                except Exception: pass
-            results.sort(key=lambda x:(x["score"],x["core_score"],x["change24"]),reverse=True); self.scanned_count=len(results)
-            # Existing positions must be managed independently of AI. A broken AI must never block exits.
-            self.manage_positions()
-            eligible=[x for x in results if x["score"]>=max(4,self.entry_score) and x["core_score"]>=3][:self.ai_candidates]
-            fresh=dict(self.last_ai_at); self.ai_reviews=self.ai_research(eligible); self.ai_review_count=sum(1 for c in eligible if self.last_ai_at.get(c["symbol"],0)!=fresh.get(c["symbol"],0))
+            self.last_check=self.now_tr().strftime('%d.%m.%Y %H:%M:%S'); self.last_error=None; self.last_ai_error=None; self._reset_daily()
+            if self.live_trading and not self.binance.configured: self.last_error='Binance API anahtarı eksik'; return
+            products=self.get_products(); rough=[]
+            # First pass: one 5m request per symbol. This is the key fix versus the old Coinbase/451 path.
+            for p in products:
+                try:
+                    x=self.technical_analyze(p); rough.append(x)
+                except Exception: continue
+            rough.sort(key=lambda x:(x['score'],x['core_score'],x['change24'],x['volume_ratio']),reverse=True); results=rough[:self.scan_limit]; self.scanned_count=len(results)
+            eligible=[x for x in results if x['decision']=='AL ADAYI' and x['score']>=5][:self.ai_candidates]; self.ai_reviews=self.ai_research(eligible); self.ai_review_count=len(eligible)
             for x in results:
-                x["ai"]=self.ai_reviews.get(x["symbol"]); x["final_decision"]="AL" if x.get("ai",{}).get("decision")=="AL" and x.get("ai",{}).get("score",0)>=self.ai_min_score else x["decision"]
-            self.signals={x["symbol"]:x for x in results}
-            ranked=[x for x in results if x["decision"]=="AL ADAYI" and (x.get("ai",{}).get("decision")=="AL" and x.get("ai",{}).get("score",0)>=self.ai_min_score and x.get("ai",{}).get("risk")!="YÜKSEK" or self.allow_without_ai and not self.groq_key)]
-            ranked.sort(key=lambda x:(x.get("ai",{}).get("score",0),x["score"],x["change24"]),reverse=True)
-            if not ranked:self.last_trade_block_reason=f"Alım yok: AI {self.ai_min_score}+ skorlu güvenli AL adayı yok." if not self.allow_without_ai else "Alım yok: teknik olarak uygun aday bulunamadı."
+                x['ai']=self.ai_reviews.get(x['symbol']); x['final_decision']='AL' if x.get('ai',{}).get('decision')=='AL' and x.get('ai',{}).get('score',0)>=self.ai_min_score else x['decision']
+            self.signals={x['symbol']:x for x in results}; self.manage_positions()
+            ranked=[x for x in results if x['decision']=='AL ADAYI' and (self.allow_without_ai or (x.get('ai',{}).get('decision')=='AL' and x.get('ai',{}).get('score',0)>=self.ai_min_score)) and x.get('ai',{}).get('risk')!='YÜKSEK']; ranked.sort(key=lambda x:(x.get('ai',{}).get('score',0),x['score'],x['change24']),reverse=True)
+            if not ranked:self.last_trade_block_reason=('Alım yok: AI başarısız • '+self.last_ai_error[:250]) if self.last_ai_error else f'Alım yok: AI {self.ai_min_score}+ skorlu aday yok.'
             opened=0
             for s in ranked:
-                if len(self.positions)>=self.max_positions:break
-                if self._open(s):opened+=1
-            if opened:self.last_trade_block_reason=f"{opened} {'canlı' if not self.dry_run else 'sanal'} pozisyon açıldı."
+                if len(self.positions)>=self.max_positions: break
+                if self._open(s): opened+=1
+            if opened:self.last_trade_block_reason=f'{opened} pozisyon açıldı.'
             self._save_state(); self.last_scan_ms=int(time.time()*1000)
-        finally:self.next_scan_at=time.time()+self.scan_interval_seconds;self.lock.release()
+        finally:self.next_scan_at=time.time()+self.scan_interval_seconds; self.lock.release()
 
     def status(self):
-        self._reset_daily_stats(); fx=self.get_fx()
+        self._reset_daily()
         if self.dry_run:
-            market_value=sum(p.get("last",0)*p.get("qty",0) for p in self.positions.values())*fx; cash=self.balance_try; equity=cash+market_value
+            market=sum(float(p.get('last',p.get('entry',0)))*float(p.get('qty',0)) for p in self.positions.values()); cash=self.balance_try; equity=cash+market
         else:
-            try: cash=self.bn.free_balance(self.quote_asset)*fx; market_value=sum(p.get("last",0)*p.get("qty",0) for p in self.positions.values())*fx; equity=cash+market_value
-            except Exception as e: cash=0;market_value=0;equity=0;self.last_error=f"Canlı bakiye okunamadı: {e}"
-        total_pnl=equity-self.initial_balance; closed=self.trade_stats["sell_count"]; wr=self.trade_stats["wins"]/closed*100 if closed else 0
-        ranked=sorted(self.signals.values(),key=lambda x:(x.get("final_decision")=="AL",x.get("ai",{}).get("score",0),x.get("score",0),x.get("change24",0)),reverse=True)
-        return {"running":self.running,"dry_run":self.dry_run,"live_trading":self.live_trading,"mode":self.mode,"exchange":"Binance Spot","binance_testnet":self.bn.testnet,"cash_try":money(cash),"balance_try":money(equity),"market_value_try":money(market_value),"pnl":money(total_pnl),"realized_pnl":money(self.realized_pnl),"positions":list(self.positions.values()),"signals":ranked[:25],"scanned_count":self.scanned_count,"ai_review_count":self.ai_review_count,"last_check":self.last_check,"last_error":self.last_error,"trade_block_reason":self.last_trade_block_reason,"last_ai_error":self.last_ai_error,"groq_status":self.last_groq_status,"groq_cooldown_seconds":max(0,int(self.groq_cooldown_until-time.time())),"last_ai_request_at":self.last_ai_request_at,"ai_batch_size":self.ai_batch_size,"scan_interval_seconds":self.scan_interval_seconds,"settings":self.settings(),"data_source":"Binance Spot market data + Binance Spot trading API","entry_logic":"5dk/15dk/1s teknik filtre + Groq AI + risk motoru","exit_logic":f"Min alış {self.min_buy_try:.0f} TL • Min zarar -{self.min_loss_try:.0f} TL • Min kâr +{self.min_profit_try:.0f} TL • trailing {self.trailing*100:.1f}%","runtime":self.runtime(),"daily_stats":{"day":self.trade_stats["day"],"daily_pnl":money(self.trade_stats["daily_realized_pnl"]),"total_buy_try":money(self.trade_stats["total_buy_try"]),"total_sell_try":money(self.trade_stats["total_sell_try"]),"wins":self.trade_stats["wins"],"losses":self.trade_stats["losses"],"win_rate":round(wr,1)},"risk_guard":{"daily_loss_limit_try":self.max_daily_loss_try,"consecutive_losses":self.consecutive_losses,"max_consecutive_losses":self.max_consecutive_losses,"cooldown_seconds":max(0,int(self.cooldown_until-time.time()))},"history":self.history[:30]}
+            try: cash=self.binance.try_available(); market=sum(float(p.get('last',p.get('entry',0)))*float(p.get('qty',0)) for p in self.positions.values()); equity=cash+market
+            except Exception as e: cash=market=equity=0; self.last_error=f'Canlı bakiye okunamadı: {e}'
+        total_pnl=equity-self.initial_balance; closed=self.trade_stats['sell_count']; wr=self.trade_stats['wins']/closed*100 if closed else 0
+        ranked=sorted(self.signals.values(),key=lambda x:(x.get('final_decision')=='AL',x.get('ai',{}).get('score',0),x.get('score',0)),reverse=True)[:self.ai_candidates]
+        return {'running':self.running,'dry_run':self.dry_run,'live_trading':self.live_trading,'mode':self.mode,'balance_try':equity,'cash_try':cash,'pnl':total_pnl,'positions':list(self.positions.values()),'signals':ranked,'scanned_count':self.scanned_count,'ai_review_count':self.ai_review_count,'runtime':self.runtime(),'last_check':self.last_check,'last_error':self.last_error,'last_ai_error':self.last_ai_error,'last_groq_status':self.last_groq_status,'ai_batch_size':self.ai_batch_size,'trade_block_reason':self.last_trade_block_reason,'history':self.history[:30],'settings':self.settings(),'daily_stats':{**self.trade_stats,'win_rate':wr},'risk_guard':{'daily_loss_limit_try':self.max_daily_loss_try,'consecutive_losses':self.consecutive_losses,'max_consecutive_losses':self.max_consecutive_losses},'data_source':'Binance TR symbols + Binance market klines','entry_logic':'EMA20>EMA50 + RSI + MACD + hacim + momentum + 15dk/1s onay + AI','exit_logic':f'min zarar {self.min_loss_try:.0f} TL • min kâr {self.min_profit_try:.0f} TL • trailing'}

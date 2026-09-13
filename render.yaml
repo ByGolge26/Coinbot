@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: coinbot-v21-binance
+    name: coinbot-v22-binance-tr
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
@@ -9,10 +9,6 @@ services:
         value: "false"
       - key: LIVE_CONFIRM
         value: ""
-      - key: DRY_RUN
-        value: "true"
-      - key: BINANCE_TESTNET
-        value: "true"
       - key: BINANCE_API_KEY
         sync: false
       - key: BINANCE_API_SECRET
@@ -22,8 +18,6 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: AI_MODEL
-        value: "openai/gpt-oss-20b"
-      - key: AI_FALLBACK_MODEL
         value: "llama-3.1-8b-instant"
       - key: AI_CANDIDATES
         value: "8"
