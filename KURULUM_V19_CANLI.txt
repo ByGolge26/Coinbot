@@ -1,0 +1,71 @@
+YATIRIM BOTU V19 - GERÇEK PARA HAZIRLIK VE CANLIYA GEÇİŞ
+
+ÖNEMLİ: V19 paketinde canlı emir motoru var, ancak ZIP varsayılan olarak DRY RUN'dadır. Ben senin Render hesabına erişemediğim için uzaktan canlı modu açamam. Gerçek paraya geçişi senin Render Environment ekranında son güvenlik adımıyla açman gerekir.
+
+V19'UN EKLEDİKLERİ
+- Coinbase Advanced Trade CDP JWT kimlik doğrulaması.
+- Gerçek USD kullanılabilir bakiye okuma.
+- Gerçek market BUY/SELL emri.
+- Emir öncesi Preview Order.
+- Coin bazında base/quote increment ve minimum miktar kontrolü.
+- Dolum (fill) ve komisyon bilgisini order sonucundan takip etme.
+- TRY bütçesini güncel USD/TRY kuru ile USD quote size'a çevirme.
+- 1000 TL minimum alış, 100 TL minimum zarar, 150 TL minimum kâr.
+- %25 pozisyon sınırı, %75 aktif sermaye.
+- Günlük maksimum zarar limiti: 200 TL.
+- 3 ardışık kayıpta 30 dk yeni alım cooldown.
+- AI onayı olmadan canlı alım yok.
+- Duplicate order koruması.
+- PostgreSQL ile bot state/pozisyon/geçmiş saklama.
+- Panelde LIVE/DRY RUN durumu ve Coinbase bağlantı testi.
+- Web araştırması kapalı; AI yalnızca teknik veriyi değerlendiriyor.
+
+RENDER KURULUMU
+1) GitHub'a V19 dosyalarını koy.
+2) Render'da mevcut Coinbot servisini V19 koduyla deploy et.
+3) Render -> Environment bölümüne:
+   GROQ_API_KEY = mevcut Groq anahtarın
+   COINBASE_API_KEY_NAME = Coinbase CDP API Key Name
+   COINBASE_API_PRIVATE_KEY = Coinbase CDP Private Key (PEM)
+   DATABASE_URL = Render PostgreSQL bağlantı stringi
+4) İlk etapta:
+   LIVE_TRADING=false
+   DRY_RUN=true
+5) Deploy et.
+6) Panelde '🔐 Coinbase Bağlantısını Test Et' butonuna bas. Bu buton emir göndermez, yalnızca view bağlantısını test eder.
+7) Coinbase bağlantısı başarılı olmadan canlı moda geçme.
+
+COINBASE API KEY
+- CDP API key oluştururken yalnızca View + Trade izinlerini kullan.
+- Transfer/withdraw yetkisi verme.
+- Private key'i sohbet, GitHub veya dosyaya açık olarak koyma. Yalnızca Render Environment Secret olarak gir.
+
+CANLI MODU AÇMA
+Render Environment:
+LIVE_TRADING=true
+LIVE_CONFIRM=I_UNDERSTAND_REAL_MONEY_TRADING
+DRY_RUN=false
+
+Sonra Manual Deploy -> Deploy latest commit.
+Panelde '🔴 CANLI İŞLEM aktif' görmeden gerçek emir gönderilmez.
+
+İLK CANLI TEST
+- İlk canlı testte düşük bakiye ile başlat.
+- Önce Coinbase bağlantısını kontrol et.
+- Bir işlem açılırsa panelde Order ID, Alış TL, Coin miktarı, komisyon ve gerçekleşmemiş K/Z görünmeli.
+- Satış gerçekleştiğinde İşlem Geçmişi'nde gerçek BUY/SELL bilgisi görünmeli.
+- İlk birkaç işlemin emir/fill/komisyon kayıtlarını kontrol et.
+
+KORUMALAR
+- AI başarısızsa canlı alım yok.
+- Günlük zarar limiti aşılırsa yeni alım yok.
+- 3 ardışık kayıpta 30 dk yeni alım yok.
+- Pozisyon başına %25'ten fazla sermaye yok.
+- Aktif sermaye %75 ile sınırlandırılır.
+- Minimum alış 1000 TL'dir.
+- Minimum zarar çıkışı -100 TL'dir.
+- Minimum kâr çıkışı +150 TL'dir.
+- Emir miktarı Coinbase ürün increment/minimum değerlerine göre aşağı yuvarlanır.
+
+GERÇEK PARA UYARISI
+Bu sistem kâr garantisi vermez. Market emirleri kayma (slippage), spread, ücret, API kesintisi ve likidite nedeniyle beklenenden farklı sonuçlanabilir. V19'da risk kilitleri var, ancak hiçbir yazılım piyasa riskini ortadan kaldırmaz.

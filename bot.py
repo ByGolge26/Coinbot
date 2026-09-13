@@ -1,811 +1,473 @@
-
-import os, time, json, re, requests, pandas as pd, numpy as np
-import threading
-from datetime import datetime, timezone
+import os, time, json, re, math, uuid, threading
+from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+
+import requests
+import pandas as pd
+import numpy as np
+import jwt
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
+from cryptography.hazmat.primitives import serialization
 
 PUBLIC_PRODUCTS = "https://api.coinbase.com/api/v3/brokerage/market/products"
 PUBLIC_CANDLES = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles"
 GROQ_CHAT = "https://api.groq.com/openai/v1/chat/completions"
+COINBASE_BASE = "https://api.coinbase.com"
+FX_URL = "https://api.frankfurter.app/latest"
+TR_ZONE = ZoneInfo("Europe/Istanbul")
+
+
+def money(v):
+    return round(float(v), 2)
+
+
+def dec_floor(value, increment):
+    v = Decimal(str(value))
+    inc = Decimal(str(increment))
+    if inc <= 0:
+        return float(v)
+    return float((v / inc).to_integral_value(rounding=ROUND_DOWN) * inc)
+
+
+class CoinbaseClient:
+    def __init__(self):
+        self.key_name = os.getenv("COINBASE_API_KEY_NAME", "").strip()
+        self.private_key = os.getenv("COINBASE_API_PRIVATE_KEY", "").strip().replace("\\n", "\n")
+        self.timeout = int(os.getenv("COINBASE_HTTP_TIMEOUT", "20"))
+
+    @property
+    def configured(self):
+        return bool(self.key_name and self.private_key)
+
+    def _private_key_obj(self):
+        secret = self.private_key
+        if secret.startswith("-----BEGIN"):
+            return serialization.load_pem_private_key(secret.encode(), password=None)
+        raise ValueError("COINBASE_API_PRIVATE_KEY PEM formatında değil")
+
+    def _jwt(self, method, path):
+        if not self.configured:
+            raise RuntimeError("Coinbase API anahtarı yapılandırılmamış")
+        key = self._private_key_obj()
+        alg = "EdDSA" if key.__class__.__name__.startswith("Ed25519") else "ES256"
+        now = int(time.time())
+        claims = {
+            "sub": self.key_name,
+            "iss": "cdp",
+            "nbf": now,
+            "exp": now + 120,
+            "uri": f"{method.upper()} api.coinbase.com{path}",
+        }
+        return jwt.encode(claims, key, algorithm=alg, headers={"kid": self.key_name, "nonce": uuid.uuid4().hex})
+
+    def request(self, method, path, params=None, body=None):
+        token = self._jwt(method, path)
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "YatirimBot/19"}
+        r = requests.request(method, COINBASE_BASE + path, params=params, json=body, headers=headers, timeout=self.timeout)
+        if not r.ok:
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text
+            raise RuntimeError(f"Coinbase HTTP {r.status_code}: {str(detail)[:700]}")
+        return r.json()
+
+    def accounts(self):
+        return self.request("GET", "/api/v3/brokerage/accounts", params={"limit": 250}).get("accounts", [])
+
+    def usd_available(self):
+        for a in self.accounts():
+            if a.get("currency") == "USD" and a.get("active", True):
+                return float((a.get("available_balance") or {}).get("value") or 0)
+        return 0.0
+
+    def product(self, symbol):
+        return self.request("GET", f"/api/v3/brokerage/products/{symbol}")
+
+    def preview(self, product_id, side, order_configuration):
+        return self.request("POST", "/api/v3/brokerage/orders/preview", body={
+            "product_id": product_id,
+            "side": side,
+            "order_configuration": order_configuration,
+        })
+
+    def create_market_buy(self, product_id, quote_usd):
+        client_id = str(uuid.uuid4())
+        body = {
+            "client_order_id": client_id,
+            "product_id": product_id,
+            "side": "BUY",
+            "order_configuration": {"market_market_ioc": {"quote_size": f"{quote_usd:.8f}"}},
+        }
+        return self.request("POST", "/api/v3/brokerage/orders", body=body)
+
+    def create_market_sell(self, product_id, base_size):
+        client_id = str(uuid.uuid4())
+        body = {
+            "client_order_id": client_id,
+            "product_id": product_id,
+            "side": "SELL",
+            "order_configuration": {"market_market_ioc": {"base_size": f"{base_size:.12f}"}},
+        }
+        return self.request("POST", "/api/v3/brokerage/orders", body=body)
+
+    def order(self, order_id):
+        return self.request("GET", f"/api/v3/brokerage/orders/historical/{order_id}").get("order", {})
+
 
 class TradingBot:
     def __init__(self):
+        self.lock = threading.Lock()
         self.running = True
-        self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
         self.started_at = datetime.now(timezone.utc)
+
+        self.live_trading = os.getenv("LIVE_TRADING", "false").lower() == "true"
+        self.live_confirm = os.getenv("LIVE_CONFIRM", "") == "I_UNDERSTAND_REAL_MONEY_TRADING"
+        self.dry_run = not (self.live_trading and self.live_confirm)
+        self.mode = "LIVE" if not self.dry_run else "DRY RUN"
 
         self.balance_try = float(os.getenv("STARTING_TRY_BALANCE", "5000"))
         self.initial_balance = self.balance_try
         self.realized_pnl = 0.0
+        self.fx_rate = None
+        self.fx_at = 0.0
 
         self.risk = float(os.getenv("RISK_PER_TRADE", "0.01"))
         self.tp = float(os.getenv("TAKE_PROFIT", "0.025"))
         self.sl = float(os.getenv("STOP_LOSS", "0.01"))
         self.trailing = float(os.getenv("TRAILING_STOP", "0.01"))
-
         self.min_buy_try = max(1000.0, float(os.getenv("MIN_BUY_TRY", "1000")))
         self.min_loss_try = max(100.0, float(os.getenv("MIN_LOSS_TRY", "100")))
         self.min_profit_try = max(150.0, float(os.getenv("MIN_PROFIT_TRY", "150")))
+        self.max_daily_loss_try = max(100.0, float(os.getenv("MAX_DAILY_LOSS_TRY", "200")))
+        self.max_consecutive_losses = max(1, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")))
+        self.loss_cooldown_minutes = max(5, int(os.getenv("LOSS_COOLDOWN_MINUTES", "30")))
 
         self.max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
         self.position_pct = min(0.25, float(os.getenv("POSITION_SIZE_PCT", "0.25")))
         self.active_capital_pct = min(1.0, max(0.05, float(os.getenv("ACTIVE_CAPITAL_PCT", "0.75"))))
-
         self.entry_score = max(4, int(os.getenv("ENTRY_SCORE", "4")))
         self.scan_limit = min(60, max(10, int(os.getenv("SCAN_LIMIT", "40"))))
-        self.ai_candidates = min(10, max(3, int(os.getenv("AI_CANDIDATES", "5"))))
+        self.ai_candidates = min(10, max(3, int(os.getenv("AI_CANDIDATES", "8"))))
         self.ai_min_score = min(100, max(50, int(os.getenv("AI_MIN_SCORE", "70"))))
         self.ai_model = os.getenv("AI_MODEL", "openai/gpt-oss-20b")
-        self.ai_fallback_model = os.getenv("AI_FALLBACK_MODEL", "openai/gpt-oss-20b")
+        self.ai_fallback_model = os.getenv("AI_FALLBACK_MODEL", self.ai_model)
         self.ai_cache_minutes = max(5, int(os.getenv("AI_CACHE_MINUTES", "15")))
-        self.last_ai_at = {}
-        self.allow_without_ai = os.getenv("ALLOW_WITHOUT_AI", "false").lower() == "true"
+        self.allow_without_ai = False
         self.groq_key = os.getenv("GROQ_API_KEY", "").strip()
 
         self.positions = {}
         self.history = []
         self.signals = {}
         self.ai_reviews = {}
+        self.last_ai_at = {}
         self.last_check = None
         self.last_error = None
+        self.last_ai_error = None
+        self.last_trade_block_reason = "Henüz tarama yapılmadı."
         self.scanned_count = 0
         self.ai_review_count = 0
-        self.data_source = "Coinbase public market data"
         self.last_scan_ms = 0
-        self.last_trade_block_reason = "Henüz tarama yapılmadı."
-        self.scan_interval_seconds = max(120, int(os.getenv("SCAN_INTERVAL_SECONDS", "600")))
-        self.next_scan_at = 0.0
-        self.tick_lock = threading.Lock()
-        self.last_ai_error = None
-        self.groq_cooldown_until = 0.0
+        self.next_scan_at = 0
+        self.scan_interval_seconds = max(120, int(os.getenv("SCAN_INTERVAL_SECONDS", "300")))
+        self.groq_cooldown_until = 0
         self.last_groq_status = "Hazır"
         self.last_ai_request_at = None
         self.ai_batch_size = 0
+        self.pending_symbols = set()
+        self.last_sell_at = {}
+        self.consecutive_losses = 0
+        self.cooldown_until = 0
 
-        self.trade_stats = {
-            "buy_count": 0,
-            "sell_count": 0,
-            "total_buy_try": 0.0,
-            "total_sell_try": 0.0,
-            "wins": 0,
-            "losses": 0,
-            "daily_realized_pnl": 0.0,
-            "day": datetime.now(ZoneInfo("Europe/Istanbul")).date().isoformat(),
-        }
+        self.trade_stats = {"buy_count":0,"sell_count":0,"total_buy_try":0.0,"total_sell_try":0.0,"wins":0,"losses":0,"daily_realized_pnl":0.0,"day":self.now_tr_date()}
+        self.cb = CoinbaseClient()
+        self._load_state()
 
-    def now_tr(self):
-        return datetime.now(ZoneInfo("Europe/Istanbul"))
+        if self.live_trading and not self.live_confirm:
+            self.last_error = "LIVE_TRADING=true ama LIVE_CONFIRM eksik; güvenlik nedeniyle canlı emirler kapalı."
+        if self.live_trading and not self.cb.configured:
+            self.last_error = "Canlı mod için COINBASE_API_KEY_NAME ve COINBASE_API_PRIVATE_KEY gerekli."
+
+    def now_tr(self): return datetime.now(TR_ZONE)
+    def now_tr_date(self): return self.now_tr().date().isoformat()
 
     def runtime(self):
-        seconds = max(0, int((datetime.now(timezone.utc) - self.started_at).total_seconds()))
-        d, rem = divmod(seconds, 86400)
-        h, rem = divmod(rem, 3600)
-        m, s = divmod(rem, 60)
-        return {
-            "uptime_text": f"{d} gün {h:02d} saat {m:02d} dk {s:02d} sn",
-            "started_at_tr": self.started_at.astimezone(ZoneInfo("Europe/Istanbul")).strftime("%d.%m.%Y %H:%M:%S"),
-            "now_tr": self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
-        }
+        seconds = max(0, int((datetime.now(timezone.utc)-self.started_at).total_seconds()))
+        d, rem = divmod(seconds, 86400); h, rem = divmod(rem, 3600); m, s = divmod(rem,60)
+        return {"uptime_text":f"{d} gün {h:02d} saat {m:02d} dk {s:02d} sn", "started_at_tr":self.started_at.astimezone(TR_ZONE).strftime("%d.%m.%Y %H:%M:%S"), "now_tr":self.now_tr().strftime("%d.%m.%Y %H:%M:%S")}
+
+    def _load_state(self):
+        self.database_url = os.getenv("DATABASE_URL", "").strip()
+        if not self.database_url or psycopg is None:
+            if self.live_trading:
+                self.last_error = "Canlı mod için DATABASE_URL gerekli. Render PostgreSQL bağlanmadan canlı işlem açılmayacak."
+            return
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())")
+                    cur.execute("SELECT payload FROM bot_state WHERE id=1")
+                    row=cur.fetchone()
+                    if row:
+                        data=row[0]
+                        self.positions=data.get("positions",{})
+                        self.history=data.get("history",[])
+                        self.trade_stats=data.get("trade_stats",self.trade_stats)
+                        self.realized_pnl=float(data.get("realized_pnl",0))
+                        self.consecutive_losses=int(data.get("consecutive_losses",0))
+                        self.cooldown_until=float(data.get("cooldown_until",0))
+                        self.last_sell_at=data.get("last_sell_at",{})
+                        self.initial_balance=float(data.get("initial_balance",self.initial_balance))
+        except Exception as e:
+            self.last_error=f"Veritabanı yükleme hatası: {type(e).__name__}: {e}"
+            if self.live_trading:
+                self.last_error += " • Canlı işlem güvenlik nedeniyle kapalı."
+
+    def _save_state(self):
+        if not self.database_url or psycopg is None:
+            return
+        payload={"positions":self.positions,"history":self.history[:100],"trade_stats":self.trade_stats,"realized_pnl":self.realized_pnl,"consecutive_losses":self.consecutive_losses,"cooldown_until":self.cooldown_until,"last_sell_at":self.last_sell_at,"initial_balance":self.initial_balance}
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())")
+                    cur.execute("INSERT INTO bot_state (id,payload) VALUES (1,%s) ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()", (json.dumps(payload,ensure_ascii=False),))
+        except Exception as e:
+            self.last_error=f"Veritabanı kayıt hatası: {type(e).__name__}: {e}"
 
     def _reset_daily_stats(self):
-        today = self.now_tr().date().isoformat()
+        today=self.now_tr_date()
         if self.trade_stats["day"] != today:
-            self.trade_stats = {
-                "buy_count": 0, "sell_count": 0, "total_buy_try": 0.0,
-                "total_sell_try": 0.0, "wins": 0, "losses": 0,
-                "daily_realized_pnl": 0.0, "day": today
-            }
+            self.trade_stats.update({"buy_count":0,"sell_count":0,"total_buy_try":0.0,"total_sell_try":0.0,"wins":0,"losses":0,"daily_realized_pnl":0.0,"day":today})
+            self.consecutive_losses=0
 
     def settings(self):
-        return {
-            "risk": self.risk, "tp": self.tp, "sl": self.sl, "trailing": self.trailing,
-            "max_positions": self.max_positions, "position_pct": self.position_pct,
-            "active_capital_pct": self.active_capital_pct, "entry_score": self.entry_score,
-            "scan_limit": self.scan_limit, "min_buy_try": self.min_buy_try,
-            "min_loss_try": self.min_loss_try, "min_profit_try": self.min_profit_try,
-            "ai_candidates": self.ai_candidates, "ai_min_score": self.ai_min_score,
-            "ai_model": self.ai_model, "ai_provider": "Groq normal model (web araştırması kapalı)", "ai_cache_minutes": self.ai_cache_minutes, "scan_interval_seconds": self.scan_interval_seconds
-        }
+        return {"risk":self.risk,"tp":self.tp,"sl":self.sl,"trailing":self.trailing,"max_positions":self.max_positions,"position_pct":self.position_pct,"active_capital_pct":self.active_capital_pct,"entry_score":self.entry_score,"scan_limit":self.scan_limit,"min_buy_try":self.min_buy_try,"min_loss_try":self.min_loss_try,"min_profit_try":self.min_profit_try,"ai_candidates":self.ai_candidates,"ai_min_score":self.ai_min_score,"ai_model":self.ai_model,"ai_provider":"Groq normal model • web kapalı","ai_cache_minutes":self.ai_cache_minutes,"scan_interval_seconds":self.scan_interval_seconds,"max_daily_loss_try":self.max_daily_loss_try,"max_consecutive_losses":self.max_consecutive_losses,"loss_cooldown_minutes":self.loss_cooldown_minutes,"live_trading":self.live_trading,"mode":self.mode}
 
-    def update_settings(self, d):
-        for k, attr in [("risk","risk"),("tp","tp"),("sl","sl"),("trailing","trailing")]:
+    def update_settings(self,d):
+        for k,attr in [("risk","risk"),("tp","tp"),("sl","sl"),("trailing","trailing")]:
             if k in d:
-                v = float(d[k]) / 100.0
-                if not 0 < v <= 0.25:
-                    raise ValueError(f"{k} % 0-25 arasında olmalı")
-                setattr(self, attr, v)
-        if "max_positions" in d:
-            self.max_positions = max(1, min(20, int(d["max_positions"])))
-        if "position_pct" in d:
-            v = float(d["position_pct"]) / 100.0
-            if not 0 < v <= 0.25:
-                raise ValueError("Pozisyon büyüklüğü %1-%25 arasında olmalı")
-            self.position_pct = v
-        if "active_capital_pct" in d:
-            v = float(d["active_capital_pct"]) / 100.0
-            if not 0.05 <= v <= 1.0:
-                raise ValueError("Aktif sermaye %5-%100 arasında olmalı")
-            self.active_capital_pct = v
-        if "entry_score" in d:
-            self.entry_score = max(4, min(5, int(d["entry_score"])))
-        if "scan_limit" in d:
-            self.scan_limit = max(10, min(60, int(d["scan_limit"])))
-        if "ai_candidates" in d:
-            self.ai_candidates = max(3, min(10, int(d["ai_candidates"])))
-        if "ai_min_score" in d:
-            self.ai_min_score = max(50, min(100, int(d["ai_min_score"])))
-        if "min_buy_try" in d:
-            self.min_buy_try = max(1000.0, float(d["min_buy_try"]))
-        if "min_loss_try" in d:
-            self.min_loss_try = max(100.0, float(d["min_loss_try"]))
-        if "min_profit_try" in d:
-            self.min_profit_try = max(150.0, float(d["min_profit_try"]))
+                v=float(d[k])/100
+                if not 0<v<=.25: raise ValueError(f"{k} % 0-25 arasında olmalı")
+                setattr(self,attr,v)
+        if "max_positions" in d:self.max_positions=max(1,min(20,int(d["max_positions"])))
+        if "position_pct" in d:self.position_pct=min(.25,max(.01,float(d["position_pct"])/100))
+        if "active_capital_pct" in d:self.active_capital_pct=min(1,max(.05,float(d["active_capital_pct"])/100))
+        if "entry_score" in d:self.entry_score=max(4,min(5,int(d["entry_score"])))
+        if "scan_limit" in d:self.scan_limit=max(10,min(60,int(d["scan_limit"])))
+        if "ai_candidates" in d:self.ai_candidates=max(3,min(10,int(d["ai_candidates"])))
+        if "ai_min_score" in d:self.ai_min_score=max(50,min(100,int(d["ai_min_score"])))
+        if "min_buy_try" in d:self.min_buy_try=max(1000,float(d["min_buy_try"]))
+        if "min_loss_try" in d:self.min_loss_try=max(100,float(d["min_loss_try"]))
+        if "min_profit_try" in d:self.min_profit_try=max(150,float(d["min_profit_try"]))
+
+    def get_fx(self):
+        if self.fx_rate and time.time()-self.fx_at < 1800:return self.fx_rate
+        fixed=os.getenv("USDTRY_RATE","").strip()
+        if fixed:
+            self.fx_rate=float(fixed); self.fx_at=time.time(); return self.fx_rate
+        r=requests.get(FX_URL,params={"from":"USD","to":"TRY"},timeout=10); r.raise_for_status(); rate=float(r.json()["rates"]["TRY"])
+        self.fx_rate=rate; self.fx_at=time.time(); return rate
 
     def get_products(self):
-        r = requests.get(
-            PUBLIC_PRODUCTS,
-            params={"limit": 100, "product_type": "SPOT", "get_tradability_status": "true"},
-            timeout=20,
-            headers={"User-Agent": "YatirimBot/9.0"}
-        )
-        r.raise_for_status()
-        products = r.json().get("products", [])
-        stable = {
-            "USDC","USDT","DAI","PYUSD","USDS","USDG","EURC","GUSD","TUSD",
-            "USDP","FDUSD","BUSD"
-        }
-        out = []
+        r=requests.get(PUBLIC_PRODUCTS,params={"limit":100,"product_type":"SPOT","get_tradability_status":"true"},timeout=20,headers={"User-Agent":"YatirimBot/19"});r.raise_for_status()
+        products=r.json().get("products",[]); stable={"USDC","USDT","DAI","PYUSD","USDS","USDG","EURC","GUSD","TUSD","USDP","FDUSD","BUSD"};out=[]
         for p in products:
-            pid = p.get("product_id", "")
-            base = p.get("base_currency_id", "")
-            if not pid.endswith("-USD") or not base or base in stable:
-                continue
-            if p.get("is_disabled") or p.get("trading_disabled") or p.get("view_only"):
-                continue
-            try:
-                vol = float(p.get("volume_24h") or p.get("approximate_quote_24h_volume") or 0)
-                chg = float(str(p.get("price_percentage_change_24h", "0")).replace("%",""))
-                price = float(p.get("price") or p.get("mid_market_price") or 0)
-            except Exception:
-                continue
-            if price <= 0:
-                continue
-            out.append({
-                "symbol": pid, "volume24": vol, "change24": chg,
-                "price": price, "name": p.get("base_name") or base
-            })
-        out.sort(key=lambda x: x["volume24"], reverse=True)
-        return out[:self.scan_limit]
+            pid=p.get("product_id",""); base=p.get("base_currency_id","")
+            if not pid.endswith("-USD") or not base or base in stable or p.get("is_disabled") or p.get("trading_disabled") or p.get("view_only"):continue
+            try:vol=float(p.get("volume_24h") or p.get("approximate_quote_24h_volume") or 0);chg=float(str(p.get("price_percentage_change_24h","0")).replace("%",""));price=float(p.get("price") or p.get("mid_market_price") or 0)
+            except:continue
+            if price<=0:continue
+            out.append({"symbol":pid,"volume24":vol,"change24":chg,"price":price,"name":p.get("base_name") or base})
+        out.sort(key=lambda x:x["volume24"],reverse=True);return out[:self.scan_limit]
 
-    def fetch_candles(self, symbol, granularity="FIVE_MINUTE", minutes=5, limit=200):
-        end = int(time.time())
-        start = end - (minutes * limit * 60)
-        r = requests.get(
-            PUBLIC_CANDLES.format(product_id=symbol),
-            params={"start": str(start), "end": str(end), "granularity": granularity, "limit": min(350, limit)},
-            timeout=18, headers={"User-Agent":"YatirimBot/9.0"}
-        )
-        r.raise_for_status()
-        rows = r.json().get("candles", [])
-        if len(rows) < 60:
-            raise RuntimeError(f"{symbol}: yetersiz {granularity} veri")
-        df = pd.DataFrame(rows)
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["start"] = pd.to_numeric(df["start"], errors="coerce")
-        return df.dropna().sort_values("start").reset_index(drop=True).tail(limit)
+    def fetch_candles(self,symbol,granularity="FIVE_MINUTE",minutes=5,limit=200):
+        end=int(time.time());start=end-(minutes*limit*60)
+        r=requests.get(PUBLIC_CANDLES.format(product_id=symbol),params={"start":str(start),"end":str(end),"granularity":granularity,"limit":min(350,limit)},timeout=18,headers={"User-Agent":"YatirimBot/19"});r.raise_for_status();rows=r.json().get("candles",[])
+        if len(rows)<60:raise RuntimeError(f"{symbol}: yetersiz {granularity} veri")
+        df=pd.DataFrame(rows)
+        for c in ["open","high","low","close","volume"]:df[c]=pd.to_numeric(df[c],errors="coerce")
+        df["start"]=pd.to_numeric(df["start"],errors="coerce");return df.dropna().sort_values("start").reset_index(drop=True).tail(limit)
 
-    def calc_indicators(self, df):
-        df = df.copy()
-        df["ema20"] = df.close.ewm(span=20, adjust=False).mean()
-        df["ema50"] = df.close.ewm(span=50, adjust=False).mean()
-        delta = df.close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / loss.replace(0, np.nan)
-        df["rsi"] = 100 - (100 / (1 + rs))
-        e12 = df.close.ewm(span=12, adjust=False).mean()
-        e26 = df.close.ewm(span=26, adjust=False).mean()
-        df["macd"] = e12 - e26
-        df["macds"] = df.macd.ewm(span=9, adjust=False).mean()
-        df["v20"] = df.volume.rolling(20).mean()
-        return df
+    def calc_indicators(self,df):
+        df=df.copy();df["ema20"]=df.close.ewm(span=20,adjust=False).mean();df["ema50"]=df.close.ewm(span=50,adjust=False).mean();delta=df.close.diff();gain=delta.clip(lower=0).rolling(14).mean();loss=(-delta.clip(upper=0)).rolling(14).mean();rs=gain/loss.replace(0,np.nan);df["rsi"]=100-(100/(1+rs));e12=df.close.ewm(span=12,adjust=False).mean();e26=df.close.ewm(span=26,adjust=False).mean();df["macd"]=e12-e26;df["macds"]=df.macd.ewm(span=9,adjust=False).mean();df["v20"]=df.volume.rolling(20).mean();return df
 
-    def timeframe_snapshot(self, symbol, granularity, minutes):
-        df = self.calc_indicators(self.fetch_candles(symbol, granularity, minutes))
-        x = df.iloc[-1]
-        return {
-            "price": float(x.close),
-            "ema20": float(x.ema20),
-            "ema50": float(x.ema50),
-            "rsi": float(x.rsi),
-            "macd": float(x.macd),
-            "macds": float(x.macds),
-            "volume_ratio": float(x.volume / x.v20) if x.v20 else 0.0,
-            "trend": bool(x.ema20 > x.ema50)
-        }
+    def timeframe_snapshot(self,symbol,granularity,minutes):
+        df=self.calc_indicators(self.fetch_candles(symbol,granularity,minutes));x=df.iloc[-1]
+        return {"price":float(x.close),"ema20":float(x.ema20),"ema50":float(x.ema50),"rsi":float(x.rsi),"macd":float(x.macd),"macds":float(x.macds),"volume_ratio":float(x.volume/x.v20) if x.v20 else 0,"trend":bool(x.ema20>x.ema50)}
 
-    def technical_analyze(self, product):
-        symbol = product["symbol"]
-        tf5 = self.timeframe_snapshot(symbol, "FIVE_MINUTE", 5)
-        tf15 = self.timeframe_snapshot(symbol, "FIFTEEN_MINUTE", 15)
-        tf1h = self.timeframe_snapshot(symbol, "ONE_HOUR", 60)
+    def technical_analyze(self,product):
+        symbol=product["symbol"];tf5=self.timeframe_snapshot(symbol,"FIVE_MINUTE",5);tf15=self.timeframe_snapshot(symbol,"FIFTEEN_MINUTE",15);tf1h=self.timeframe_snapshot(symbol,"ONE_HOUR",60)
+        rsi_ok=45<=tf5["rsi"]<=72;trend_ok=tf5["trend"];macd_ok=tf5["macd"]>tf5["macds"];volume_ok=tf5["volume_ratio"]>=.80;momentum_ok=product["change24"]>-2;tf15_ok=tf15["trend"] and tf15["macd"]>tf15["macds"];tf1h_ok=tf1h["trend"] and tf1h["macd"]>tf1h["macds"]
+        checks={"5dk Trend":trend_ok,"5dk RSI":rsi_ok,"5dk MACD":macd_ok,"5dk Hacim":volume_ok,"24s Momentum":momentum_ok,"15dk Onay":tf15_ok,"1s Onay":tf1h_ok};core=sum([trend_ok,rsi_ok,macd_ok,volume_ok,momentum_ok]);score=core+sum([tf15_ok,tf1h_ok]);buy=trend_ok and macd_ok and core>=max(4,self.entry_score) and score>=5 and (tf15_ok or tf1h_ok)
+        return {"symbol":symbol,"name":product["name"],"price":tf5["price"],"rsi":tf5["rsi"],"change24":product["change24"],"volume_ratio":tf5["volume_ratio"],"score":score,"core_score":core,"checks":checks,"decision":"AL ADAYI" if buy else "BEKLE","tf5":tf5,"tf15":tf15,"tf1h":tf1h,"reasons":[f"5dk trend {'uygun' if trend_ok else 'zayıf'}",f"5dk RSI {tf5['rsi']:.1f}",f"5dk MACD {'pozitif' if macd_ok else 'negatif'}",f"5dk hacim {tf5['volume_ratio']:.2f}x",f"24s momentum {product['change24']:+.2f}%",f"15dk {'onay' if tf15_ok else 'onay yok'}",f"1s {'onay' if tf1h_ok else 'onay yok'}"],"time":self.now_tr().strftime("%H:%M:%S")}
 
-        # Daha fazla kaliteli fırsat yakalamak için giriş bandı genişletildi.
-        # AI ikinci kapı olarak riskli adayları eleyecek.
-        rsi_ok = 45 <= tf5["rsi"] <= 72
-        trend_ok = tf5["trend"]
-        macd_ok = tf5["macd"] > tf5["macds"]
-        volume_ok = tf5["volume_ratio"] >= 0.80
-        momentum_ok = product["change24"] > -2.0
-        tf15_ok = tf15["trend"] and tf15["macd"] > tf15["macds"]
-        tf1h_ok = tf1h["trend"] and tf1h["macd"] > tf1h["macds"]
-
-        checks = {
-            "5dk Trend": trend_ok,
-            "5dk RSI": rsi_ok,
-            "5dk MACD": macd_ok,
-            "5dk Hacim": volume_ok,
-            "24s Momentum": momentum_ok,
-            "15dk Onay": tf15_ok,
-            "1s Onay": tf1h_ok,
-        }
-        # Core 5 conditions + higher timeframe confirmation.
-        core_score = sum([trend_ok, rsi_ok, macd_ok, volume_ok, momentum_ok])
-        mtf_score = sum([tf15_ok, tf1h_ok])
-        technical_score = core_score + mtf_score
-
-        # Adaptif giriş: 5/7 teknik puan yeterli, ancak trend + MACD
-        # ve en az bir üst zaman dilimi onayı şart. AI son kapıdır.
-        buy = (
-            trend_ok and macd_ok and
-            core_score >= max(4, self.entry_score) and
-            technical_score >= 5 and
-            (tf15_ok or tf1h_ok)
-        )
-        return {
-            "symbol": symbol,
-            "name": product["name"],
-            "price": tf5["price"],
-            "rsi": tf5["rsi"],
-            "change24": product["change24"],
-            "volume_ratio": tf5["volume_ratio"],
-            "score": technical_score,
-            "core_score": core_score,
-            "checks": checks,
-            "decision": "AL ADAYI" if buy else "BEKLE",
-            "tf5": tf5, "tf15": tf15, "tf1h": tf1h,
-            "reasons": [
-                f"5dk trend {'uygun' if trend_ok else 'zayıf'}",
-                f"5dk RSI {tf5['rsi']:.1f} {'uygun' if rsi_ok else 'uygun değil'}",
-                f"5dk MACD {'pozitif' if macd_ok else 'negatif'}",
-                f"5dk hacim {tf5['volume_ratio']:.2f}x {'uygun' if volume_ok else 'zayıf'}",
-                f"24s momentum {product['change24']:+.2f}%",
-                f"15dk {'onay' if tf15_ok else 'onay yok'}",
-                f"1s {'onay' if tf1h_ok else 'onay yok'}"
-            ],
-            "time": self.now_tr().strftime("%H:%M:%S")
-        }
-
-    def _compact_ai_result(self, parsed, sources=None):
-        """Normalize a model result into the panel's small, predictable shape."""
-        sources = sources or []
-        score = max(0, min(100, int(float(parsed.get("score", 0)))))
-        decision = parsed.get("decision", "BEKLE")
-        if decision not in ("AL", "BEKLE"):
-            decision = "BEKLE"
-        risk = parsed.get("risk", "ORTA")
-        if risk not in ("DÜŞÜK", "ORTA", "YÜKSEK"):
-            risk = "ORTA"
-        return {
-            "score": score,
-            "decision": decision,
-            "risk": risk,
-            "summary": str(parsed.get("summary", ""))[:500],
-            "positive": [str(x)[:160] for x in (parsed.get("positive") or [])[:2]],
-            "negative": [str(x)[:160] for x in (parsed.get("negative") or [])[:2]],
-            "sources": sources[:3]
-        }
-
-    def _ai_request(self, payload, headers, timeout=60):
-        # One centralized Groq gateway. 429 is handled here so fallback calls
-        # do not immediately hammer the same rate-limited endpoint again.
-        now = time.time()
-        if now < self.groq_cooldown_until:
-            wait = max(1, int(self.groq_cooldown_until - now))
-            raise RuntimeError(f"Groq rate limit bekleme süresi: {wait} sn")
-
-        self.last_ai_request_at = self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
-        r = requests.post(GROQ_CHAT, headers=headers, json=payload, timeout=timeout)
-        if not r.ok:
-            try:
-                err = r.json().get("error", {})
-                detail = err.get("message") if isinstance(err, dict) else str(err)
-            except Exception:
-                detail = r.text.strip()
-            if r.status_code == 429:
-                retry_after = r.headers.get("retry-after")
-                try:
-                    wait = max(10, min(900, int(float(retry_after)))) if retry_after else 60
-                except Exception:
-                    wait = 60
-                self.groq_cooldown_until = time.time() + wait
-                self.last_groq_status = f"429 rate limit • {wait} sn bekleme"
-                raise RuntimeError(f"Groq HTTP 429: rate limit. {wait} sn bekle")
-            self.last_groq_status = f"HTTP {r.status_code}"
-            raise RuntimeError(f"Groq HTTP {r.status_code}: {detail[:500]}")
-        self.last_groq_status = "200 OK"
-        return r.json()
-
-    def _parse_ai_message(self, data):
-        msg = ((data.get("choices") or [{}])[0].get("message") or {})
-        out = (msg.get("content") or "").strip()
-        if "```" in out:
-            out = out.replace("```json", "").replace("```", "").strip()
-        match = re.search(r"\{.*\}", out, re.S)
-        if not match:
-            raise ValueError("Groq AI geçerli JSON döndürmedi")
-        return json.loads(match.group(0)), msg
+    def _compact_ai_result(self,parsed):
+        score=max(0,min(100,int(float(parsed.get("score",0)))));decision=parsed.get("decision","BEKLE");risk=parsed.get("risk","ORTA")
+        if decision not in ("AL","BEKLE"):decision="BEKLE"
+        if risk not in ("DÜŞÜK","ORTA","YÜKSEK"):risk="ORTA"
+        return {"score":score,"decision":decision,"risk":risk,"summary":str(parsed.get("summary",""))[:400],"positive":[],"negative":[],"sources":[]}
 
     def _ai_response_format(self):
-        """Groq GPT-OSS için strict Structured Outputs şeması.
-        V17'deki json_object çağrısı bazı isteklerde 400 failed_generation üretiyordu.
-        GPT-OSS 20B strict json_schema desteklediği için cevabı doğrudan şemaya kilitliyoruz.
-        """
-        return {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "crypto_reviews",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "reviews": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "symbol": {"type": "string"},
-                                    "score": {"type": "integer", "minimum": 0, "maximum": 100},
-                                    "decision": {"type": "string", "enum": ["AL", "BEKLE"]},
-                                    "risk": {"type": "string", "enum": ["DÜŞÜK", "ORTA", "YÜKSEK"]},
-                                    "summary": {"type": "string"}
-                                },
-                                "required": ["symbol", "score", "decision", "risk", "summary"],
-                                "additionalProperties": False
-                            }
-                        }
-                    },
-                    "required": ["reviews"],
-                    "additionalProperties": False
-                }
-            }
-        }
+        return {"type":"json_schema","json_schema":{"name":"crypto_reviews","strict":True,"schema":{"type":"object","properties":{"reviews":{"type":"array","items":{"type":"object","properties":{"symbol":{"type":"string"},"score":{"type":"integer","minimum":0,"maximum":100},"decision":{"type":"string","enum":["AL","BEKLE"]},"risk":{"type":"string","enum":["DÜŞÜK","ORTA","YÜKSEK"]},"summary":{"type":"string"}},"required":["symbol","score","decision","risk","summary"],"additionalProperties":False}}},"required":["reviews"],"additionalProperties":False}}}
 
-    def _ai_fallback_batch(self, candidates, failure_text):
-        """Small single-call fallback for the whole candidate batch.
-        Never call this after a 429: the gateway already put Groq in cooldown.
-        """
-        items = []
-        for c in candidates:
-            items.append({
-                "symbol": c["symbol"], "name": c["name"],
-                "price": round(c["price"], 8), "change24": round(c["change24"], 2),
-                "rsi": round(c["rsi"], 1), "volume_ratio": round(c["volume_ratio"], 2),
-                "technical_score": c["score"]
-            })
-        prompt = (
-            "Kripto AL filtresi. Web araması yapma; sadece verilen teknik veriyi değerlendir. "
-            "Her coin için 0-100 skor ver. Güçlü teknik yapı ve makul risk varsa AL, aksi halde BEKLE. "
-            "Yalnızca JSON döndür: {\"reviews\":[{\"symbol\":\"...\",\"score\":0,\"decision\":\"AL|BEKLE\",\"risk\":\"DÜŞÜK|ORTA|YÜKSEK\",\"summary\":\"kısa Türkçe\"}]}\n"
-            + json.dumps(items, ensure_ascii=False, separators=(",", ":"))
-        )
-        payload = {
-            "model": self.ai_fallback_model,
-            "messages": [
-                {"role": "system", "content": "Türkçe yanıt ver. Sadece geçerli JSON döndür."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_completion_tokens": 700,
-            "temperature": 0.1,
-            "reasoning_effort": "low",
-            "reasoning_format": "hidden",
-            "response_format": self._ai_response_format(),
-        }
-        data = self._ai_request(payload, {
-            "Authorization": f"Bearer {self.groq_key}",
-            "Content-Type": "application/json"
-        }, timeout=45)
-        parsed, _ = self._parse_ai_message(data)
-        out = {}
-        for item in (parsed.get("reviews") or []):
-            if not isinstance(item, dict) or not item.get("symbol"):
-                continue
-            out[item["symbol"]] = self._compact_ai_result(item)
-            out[item["symbol"]]["fallback"] = True
-            out[item["symbol"]]["fallback_reason"] = str(failure_text)[:220]
-            out[item["symbol"]]["summary"] += " • Yedek AI kullanıldı; web doğrulaması yapılmadı."
-        return out
+    def _ai_request(self,payload):
+        if time.time()<self.groq_cooldown_until:raise RuntimeError("Groq cooldown")
+        self.last_ai_request_at=self.now_tr().strftime("%d.%m.%Y %H:%M:%S");r=requests.post(GROQ_CHAT,headers={"Authorization":f"Bearer {self.groq_key}","Content-Type":"application/json"},json=payload,timeout=45)
+        if not r.ok:
+            try:detail=r.json().get("error",{}).get("message",r.text)
+            except:detail=r.text
+            if r.status_code==429:self.groq_cooldown_until=time.time()+60
+            raise RuntimeError(f"Groq HTTP {r.status_code}: {str(detail)[:500]}")
+        self.last_groq_status="200 OK";return r.json()
 
-    def ai_research(self, candidates):
-        """Single compact Groq call for the candidate batch.
-        V17 intentionally does NOT use Groq Compound or web search.
-        The AI receives only the technical snapshot already calculated by the bot.
-        """
-        if not candidates:
-            return {}
-        if not self.groq_key:
-            msg = "GROQ_API_KEY yok. Render Environment Variables'a ekle."
-            decision = "AI YOK" if self.allow_without_ai else "AI ONAYI GEREKLİ"
-            return {c["symbol"]: {
-                "score": 0, "decision": decision, "risk": "Bilinmiyor",
-                "summary": msg + (" AI kapısı atlandı." if self.allow_without_ai else " Yeni işlem açılmadı."),
-                "positive": [], "negative": [], "sources": []
-            } for c in candidates}
-
-        now_ts = time.time()
-        reviews = {}
-        fresh = []
-        for c in candidates:
-            cached = self.ai_reviews.get(c["symbol"])
-            cached_at = self.last_ai_at.get(c["symbol"], 0)
-            if cached and (now_ts - cached_at) < self.ai_cache_minutes * 60:
-                reviews[c["symbol"]] = cached
-            else:
-                fresh.append(c)
-
-        if not fresh:
-            self.ai_batch_size = 0
-            self.last_groq_status = "AI önbelleği kullanıldı"
-            return reviews
-
-        if time.time() < self.groq_cooldown_until:
-            wait = max(1, int(self.groq_cooldown_until - time.time()))
-            self.last_ai_error = f"Groq rate limit sonrası {wait} sn bekleniyor."
-            self.last_groq_status = self.last_ai_error
-            for c in fresh:
-                reviews[c["symbol"]] = {
-                    "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
-                    "summary": f"Groq rate limit: {wait} sn bekleme. Bu taramada alım açılmadı.",
-                    "positive": [], "negative": [], "sources": []
-                }
-            return reviews
-
-        self.ai_batch_size = len(fresh)
-        compact = [{
-            "symbol": c["symbol"], "price": round(c["price"], 8),
-            "change24": round(c["change24"], 2), "rsi5": round(c["rsi"], 1),
-            "volume5": round(c["volume_ratio"], 2),
-            "technical_score": c["score"], "core_score": c.get("core_score", 0),
-            "tf15": bool(c.get("tf15", {}).get("trend") and c.get("tf15", {}).get("macd", 0) > c.get("tf15", {}).get("macds", 0)),
-            "tf1h": bool(c.get("tf1h", {}).get("trend") and c.get("tf1h", {}).get("macd", 0) > c.get("tf1h", {}).get("macds", 0))
-        } for c in fresh]
-
-        prompt = (
-            "Kripto alım öncesi teknik karar filtresisin. Web araştırması YAPMA ve dış bilgi kullanma. "
-            "Sadece verilen teknik veriyi değerlendir. Her coin için 0-100 skor ver. "
-            "Skor 70 ve üzerindeyse ve yapı tutarlıysa AL, aksi halde BEKLE. "
-            "Aşırı riskli veya göstergeleri çelişkili coinlerde BEKLE. "
-            "Yalnızca geçerli JSON döndür: "
-            "{\"reviews\":[{\"symbol\":\"...\",\"score\":0,\"decision\":\"AL|BEKLE\",\"risk\":\"DÜŞÜK|ORTA|YÜKSEK\",\"summary\":\"en fazla 1 kısa Türkçe cümle\"}]}\n"
-            + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
-        )
-        payload = {
-            "model": self.ai_model,
-            "messages": [
-                {"role": "system", "content": "Türkçe yanıt ver. Web araması yapma. Sadece geçerli JSON döndür."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_completion_tokens": 500,
-            "temperature": 0.1,
-            "reasoning_effort": "low",
-            "reasoning_format": "hidden",
-            "response_format": self._ai_response_format(),
-        }
+    def ai_research(self,candidates):
+        if not candidates:return {}
+        if not self.groq_key:return {c["symbol"]:{"score":0,"decision":"AI HATASI","risk":"Bilinmiyor","summary":"GROQ_API_KEY yok.","positive":[],"negative":[],"sources":[]} for c in candidates}
+        compact=[{"symbol":c["symbol"],"price":round(c["price"],8),"change24":round(c["change24"],2),"rsi":round(c["rsi"],1),"volume_ratio":round(c["volume_ratio"],2),"technical_score":c["score"],"core_score":c["core_score"]} for c in candidates]
+        prompt=("Kripto spot AL filtresi. Web kullanma. Sadece verilen teknik veriyi değerlendir. Her coin için 0-100 skor ver. AL yalnızca teknik yapı güçlü, trend/momentum tutarlı ve risk makulse ver. JSON dışında hiçbir şey üretme. " + json.dumps(compact,ensure_ascii=False,separators=(",",":")))
+        payload={"model":self.ai_model,"messages":[{"role":"system","content":"Türkçe yanıt ver. Sadece şemaya uygun JSON üret."},{"role":"user","content":prompt}],"max_completion_tokens":700,"temperature":0.1,"reasoning_effort":"low","reasoning_format":"hidden","response_format":self._ai_response_format()}
         try:
-            data = self._ai_request(payload, {
-                "Authorization": f"Bearer {self.groq_key}",
-                "Content-Type": "application/json"
-            }, timeout=45)
-            parsed, _ = self._parse_ai_message(data)
-            parsed_items = {x.get("symbol"): x for x in (parsed.get("reviews") or []) if isinstance(x, dict) and x.get("symbol")}
-            for c in fresh:
-                item = parsed_items.get(c["symbol"], {
-                    "score": 0, "decision": "BEKLE", "risk": "ORTA",
-                    "summary": "AI bu adayı değerlendirmedi."
-                })
-                result = self._compact_ai_result(item, [])
-                reviews[c["symbol"]] = result
-                self.last_ai_at[c["symbol"]] = now_ts
-                self.ai_reviews[c["symbol"]] = result
-            self.last_ai_error = None
-            self.last_groq_status = f"200 OK • Web kapalı • {len(fresh)} aday"
+            data=self._ai_request(payload);msg=((data.get("choices") or [{}])[0].get("message") or {});out=(msg.get("content") or "").strip();m=re.search(r"\{.*\}",out,re.S);parsed=json.loads(m.group(0) if m else out);items={x.get("symbol"):x for x in parsed.get("reviews",[]) if x.get("symbol")};outd={}
+            for c in candidates:
+                r=self._compact_ai_result(items.get(c["symbol"],{"score":0,"decision":"BEKLE","risk":"ORTA","summary":"AI aday için karar döndürmedi."}));outd[c["symbol"]]=r;self.ai_reviews[c["symbol"]]=r;self.last_ai_at[c["symbol"]]=time.time()
+            self.last_ai_error=None;return outd
         except Exception as e:
-            self.last_ai_error = str(e)[:500]
-            if "HTTP 429" in str(e) or "rate limit" in str(e).lower():
-                for c in fresh:
-                    reviews[c["symbol"]] = {
-                        "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
-                        "summary": f"Groq rate limit: {e}. Bu taramada alım açılmadı.",
-                        "positive": [], "negative": [], "sources": []
-                    }
-                return reviews
-            # Non-rate-limit errors: one compact retry, still without web.
-            try:
-                time.sleep(1)
-                data = self._ai_request(payload, {
-                    "Authorization": f"Bearer {self.groq_key}",
-                    "Content-Type": "application/json"
-                }, timeout=45)
-                parsed, _ = self._parse_ai_message(data)
-                parsed_items = {x.get("symbol"): x for x in (parsed.get("reviews") or []) if isinstance(x, dict) and x.get("symbol")}
-                for c in fresh:
-                    item = parsed_items.get(c["symbol"], {
-                        "score": 0, "decision": "BEKLE", "risk": "ORTA",
-                        "summary": "AI bu adayı değerlendirmedi."
-                    })
-                    result = self._compact_ai_result(item, [])
-                    result["fallback"] = True
-                    result["fallback_reason"] = str(e)[:220]
-                    reviews[c["symbol"]] = result
-                    self.last_ai_at[c["symbol"]] = now_ts
-                    self.ai_reviews[c["symbol"]] = result
-                self.last_ai_error = None
-                self.last_groq_status = f"200 OK • Web kapalı • yeniden deneme başarılı"
-            except Exception as e2:
-                self.last_ai_error = f"İlk AI: {e}; Yeniden deneme: {e2}"[:500]
-                for c in fresh:
-                    reviews[c["symbol"]] = {
-                        "score": 0, "decision": "AI HATASI", "risk": "Bilinmiyor",
-                        "summary": f"AI araştırması başarısız: {self.last_ai_error}",
-                        "positive": [], "negative": [], "sources": []
-                    }
-        return reviews
+            self.last_ai_error=str(e)[:600];self.last_groq_status="AI hatası";return {c["symbol"]:{"score":0,"decision":"AI HATASI","risk":"Bilinmiyor","summary":f"AI araştırması başarısız: {self.last_ai_error}","positive":[],"negative":[],"sources":[]} for c in candidates}
 
-    def open_sim(self, s):
-        if s["symbol"] in self.positions:
-            return False
+    def _can_live_trade(self):
+        if self.dry_run:return False,"DRY RUN"
+        if not self.live_trading or not self.live_confirm:return False,"Canlı işlem güvenlik onayı eksik"
+        if not self.cb.configured:return False,"Coinbase API anahtarı eksik"
+        if not self.database_url:return False,"DATABASE_URL eksik"
+        return True,""
 
-        # Aktif sermaye havuzu ve pozisyon başına sınır.
-        market_value = sum(float(p.get("last", p["entry"])) * float(p["qty"]) for p in self.positions.values())
-        equity = self.balance_try + market_value
-        active_budget = equity * self.active_capital_pct
-        active_used = sum(float(p.get("buy_amount_try", 0)) for p in self.positions.values())
-        remaining_budget = max(0.0, active_budget - active_used)
+    def _buy_amount_usd(self):
+        fx=self.get_fx();min_usd=self.min_buy_try/fx
+        available=self.cb.usd_available() if not self.dry_run else self.balance_try/fx
+        market_value=sum(p["last"]*p["qty"] for p in self.positions.values()) if self.positions else 0
+        equity=available+market_value;active_budget=equity*self.active_capital_pct;active_used=sum(p["buy_usd"] for p in self.positions.values());remaining=max(0,active_budget-active_used)
+        amount=min(available,equity*self.position_pct,remaining)
+        if amount+1e-9<min_usd:return 0.0
+        return amount
 
-        buy_amount = min(self.balance_try, equity * self.position_pct, remaining_budget)
-        if buy_amount + 1e-9 < self.min_buy_try:
-            return False
-
-        # AI kapısı.
-        ai = self.ai_reviews.get(s["symbol"], {})
-        if not self.allow_without_ai:
-            if ai.get("decision") != "AL" or ai.get("score", 0) < self.ai_min_score:
-                return False
-
-        entry = s["price"]
-        qty = buy_amount / max(entry, 1e-12)
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-        self.balance_try -= buy_amount
+    def _open(self,s):
+        symbol=s["symbol"]
+        if symbol in self.positions or symbol in self.pending_symbols:return False
         self._reset_daily_stats()
-        self.trade_stats["buy_count"] += 1
-        self.trade_stats["total_buy_try"] += buy_amount
+        if self.trade_stats["daily_realized_pnl"] <= -self.max_daily_loss_try:return False
+        if time.time()<self.cooldown_until:return False
+        if self.consecutive_losses>=self.max_consecutive_losses:return False
+        ai=self.ai_reviews.get(symbol,{})
+        if ai.get("decision")!="AL" or ai.get("score",0)<self.ai_min_score:return False
+        amount_usd=self._buy_amount_usd()
+        if amount_usd<=0:return False
+        fx=self.get_fx();buy_try=amount_usd*fx;product=self.cb.product(symbol) if not self.dry_run else None
+        if product:
+            qinc=float(product.get("quote_increment") or "0.01");qmin=float(product.get("quote_min_size") or "0")
+            amount_usd=dec_floor(amount_usd,qinc)
+            if amount_usd<qmin:return False
+            prev=self.cb.preview(symbol,"BUY",{"market_market_ioc":{"quote_size":f"{amount_usd:.8f}"}})
+            if prev.get("success") is False or prev.get("error_response"):
+                raise RuntimeError(f"BUY preview reddetti: {prev.get("error_response") or prev}")
+        self.pending_symbols.add(symbol)
+        try:
+            if self.dry_run:
+                price=s["price"];qty=amount_usd/max(price,1e-12);filled_value=amount_usd;fee=0;order_id="SIM-"+uuid.uuid4().hex[:12]
+            else:
+                resp=self.cb.create_market_buy(symbol,amount_usd);ok=resp.get("success",False);order_id=(resp.get("success_response") or {}).get("order_id")
+                if not ok or not order_id:raise RuntimeError(str(resp.get("error_response") or resp))
+                order={};
+                for _ in range(10):
+                    time.sleep(1);order=self.cb.order(order_id)
+                    if str(order.get("status","")).upper() in {"FILLED","CANCELLED","FAILED","REJECTED"}:break
+                qty=float(order.get("filled_size") or 0);filled_value=float(order.get("filled_value") or 0);fee=float(order.get("total_fees") or order.get("fee") or 0);price=filled_value/qty if qty>0 else s["price"]
+                if qty<=0:raise RuntimeError(f"Emir dolmadı: {order.get('status')} {order.get('reject_message','')}")
+                buy_try=(filled_value+fee)*fx
+            self.positions[symbol]={"symbol":symbol,"name":s["name"],"entry":price,"qty":qty,"buy_usd":filled_value+fee,"buy_amount_try":buy_try,"last":price,"unrealized":0,"peak_pnl":0,"ai_score":ai.get("score",0),"ai_risk":ai.get("risk",""),"opened":self.now_tr().strftime("%d.%m.%Y %H:%M:%S"),"order_id":order_id,"fee_usd":fee,"fx_rate":fx}
+            self.trade_stats["buy_count"]+=1;self.trade_stats["total_buy_try"]+=buy_try
+            self.history.insert(0,{"type":"OPEN","symbol":symbol,"price":price,"qty":qty,"buy_try":buy_try,"sell_try":None,"pnl":0,"reason":f"AL • Teknik {s['score']}/7 • AI {ai.get('score',0)}/100 • {self.mode}","time":self.now_tr().strftime("%d.%m.%Y %H:%M:%S"),"order_id":order_id})
+            self._save_state()
+            return True
+        finally:self.pending_symbols.discard(symbol)
 
-        self.positions[s["symbol"]] = {
-            "symbol": s["symbol"], "name": s["name"],
-            "entry": entry, "qty": qty, "buy_amount_try": buy_amount,
-            "stop": entry, "target": entry, "peak": entry,
-            "last": entry, "unrealized": 0, "score": s["score"],
-            "ai_score": ai.get("score", 0), "ai_risk": ai.get("risk", ""),
-            "opened": now
-        }
-
-        self.history.insert(0, {
-            "type": "OPEN", "symbol": s["symbol"], "price": entry,
-            "qty": qty, "buy_try": buy_amount, "sell_try": None, "pnl": 0,
-            "reason": f"AL • Teknik {s['score']}/7 • AI {ai.get('score',0)}/100",
-            "time": now
-        })
-        return True
+    def _close(self,symbol,p,reason):
+        fx=self.get_fx();price=s["last"];qty=p["qty"]
+        if not self.dry_run:
+            product=self.cb.product(symbol);inc=float(product.get("base_increment") or "0.00000001");minsize=float(product.get("base_min_size") or "0");qty=dec_floor(qty,inc)
+            if qty<minsize:raise RuntimeError(f"{symbol}: satış miktarı base_min_size altında")
+            self.cb.preview(symbol,"SELL",{"market_market_ioc":{"base_size":f"{qty:.12f}"}});resp=self.cb.create_market_sell(symbol,qty);oid=(resp.get("success_response") or {}).get("order_id")
+            if not resp.get("success") or not oid:raise RuntimeError(str(resp.get("error_response") or resp))
+            order={}
+            for _ in range(10):
+                time.sleep(1);order=self.cb.order(oid)
+                if str(order.get("status","")).upper() in {"FILLED","CANCELLED","FAILED","REJECTED"}:break
+            filled=float(order.get("filled_size") or 0);value=float(order.get("filled_value") or 0);fee=float(order.get("total_fees") or order.get("fee") or 0)
+            if filled<=0:raise RuntimeError(f"Satış dolmadı: {order.get('status')} {order.get('reject_message','')}")
+            sell_usd=value-fee;sell_try=sell_usd*fx;qty=filled
+        else:
+            sell_usd=price*qty;sell_try=sell_usd*fx;fee=0;oid="SIM-"+uuid.uuid4().hex[:12]
+        pnl=sell_try-p["buy_amount_try"]
+        self.trade_stats["sell_count"]+=1;self.trade_stats["total_sell_try"]+=sell_try;self.trade_stats["daily_realized_pnl"]+=pnl;self.realized_pnl+=pnl
+        if pnl>0:self.trade_stats["wins"]+=1;self.consecutive_losses=0
+        elif pnl<0:self.trade_stats["losses"]+=1;self.consecutive_losses+=1;self.cooldown_until=time.time()+self.loss_cooldown_minutes*60 if self.consecutive_losses>=self.max_consecutive_losses else 0
+        self.history.insert(0,{"type":"CLOSE","symbol":symbol,"price":price,"qty":qty,"buy_try":p["buy_amount_try"],"sell_try":sell_try,"pnl":pnl,"reason":reason,"time":self.now_tr().strftime("%d.%m.%Y %H:%M:%S"),"order_id":oid,"fee_usd":fee})
+        self.last_sell_at[symbol]=time.time();del self.positions[symbol];self._save_state()
 
     def manage_positions(self):
-        for symbol, p in list(self.positions.items()):
+        for symbol,p in list(self.positions.items()):
             try:
-                product = {"symbol": symbol, "name": p.get("name", symbol), "change24": 0}
-                s = self.technical_analyze(product)
-                price = s["price"]
-                p["last"] = price
-                p["peak"] = max(p["peak"], price)
-                current_value = price * p["qty"]
-                pnl = current_value - p["buy_amount_try"]
-                p["unrealized"] = pnl
-                p["stop"] = p["entry"]  # informational
-                p["target"] = p["entry"]
+                s=self.technical_analyze({"symbol":symbol,"name":p.get("name",symbol),"change24":0});p["last"]=s["price"];p["peak_price"]=max(float(p.get("peak_price",p["entry"])),p["last"]);value=p["last"]*p["qty"];pnl=(value-p["buy_usd"])*self.get_fx();p["unrealized"]=pnl;p["peak_pnl"]=max(float(p.get("peak_pnl",0)),pnl)
+                loss=pnl<=-self.min_loss_try
+                profit=pnl>=self.min_profit_try
+                trailing=False
+                if p["peak_pnl"]>=self.min_profit_try:trailing=pnl<=p["peak_pnl"]*(1-self.trailing)
+                if loss:self._close(symbol,p,f"ZARAR EŞİĞİ (-{self.min_loss_try:.0f} TL)")
+                elif profit or trailing:self._close(symbol,p,f"KÂR/TRAILING (+{pnl:.0f} TL)")
+            except Exception as e:self.last_error=f"Pozisyon yönetimi {symbol}: {type(e).__name__}: {e}"
 
-                loss_hit = pnl <= -self.min_loss_try
-                profit_hit = pnl >= self.min_profit_try
-
-                # Once +150 TL has been reached, allow a trailing lock,
-                # but never sell below +150 TL.
-                trailing_lock = False
-                if float(p.get("peak_pnl", 0)) < pnl:
-                    p["peak_pnl"] = pnl
-                if p.get("peak_pnl", 0) >= self.min_profit_try:
-                    lock = max(self.min_profit_try, p["peak_pnl"] * 0.75)
-                    trailing_lock = self.min_profit_try <= pnl <= lock
-
-                if loss_hit or profit_hit or trailing_lock:
-                    sell_try = current_value
-                    realized = sell_try - p["buy_amount_try"]
-                    self.balance_try += sell_try
-                    self.realized_pnl += realized
-                    self._reset_daily_stats()
-
-                    self.trade_stats["sell_count"] += 1
-                    self.trade_stats["total_sell_try"] += sell_try
-                    self.trade_stats["daily_realized_pnl"] += realized
-                    if realized > 0:
-                        self.trade_stats["wins"] += 1
-                    elif realized < 0:
-                        self.trade_stats["losses"] += 1
-
-                    reason = (
-                        f"ZARAR EŞİĞİ (-{self.min_loss_try:.0f} TL)" if loss_hit else
-                        f"KÂR EŞİĞİ (+{self.min_profit_try:.0f} TL)" if profit_hit else
-                        f"TRAILING (min +{self.min_profit_try:.0f} TL)"
-                    )
-                    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    self.history.insert(0, {
-                        "type": "CLOSE", "symbol": symbol, "price": price, "qty": p["qty"],
-                        "buy_try": p["buy_amount_try"], "sell_try": sell_try, "pnl": realized,
-                        "reason": reason, "time": now
-                    })
-                    del self.positions[symbol]
-            except Exception as e:
-                self.last_error = f"Pozisyon yönetimi {symbol}: {type(e).__name__}: {e}"
-
-    def tick(self, force=False):
-        if not self.running:
-            return
-        now = time.time()
-        if not force and now < self.next_scan_at:
-            return
-        if not self.tick_lock.acquire(blocking=False):
-            self.last_trade_block_reason = "Tarama zaten çalışıyor; ikinci tarama engellendi."
-            return
+    def tick(self,force=False):
+        if not self.running:return
+        if not force and time.time()<self.next_scan_at:return
+        if not self.lock.acquire(blocking=False):return
         try:
-            self.last_check = self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
-            self.last_check = self.now_tr().strftime("%d.%m.%Y %H:%M:%S")
-            self.last_error = None
-
-            try:
-                products = self.get_products()
-            except Exception as e:
-                self.last_error = f"Coin listesi alınamadı: {type(e).__name__}: {e}"
-                return
-
-            results = []
+            self.last_check=self.now_tr().strftime("%d.%m.%Y %H:%M:%S");self.last_error=None;self._reset_daily_stats()
+            if self.live_trading and not self.cb.configured:self.last_error="Coinbase API anahtarı eksik";return
+            try:products=self.get_products()
+            except Exception as e:self.last_error=f"Coin listesi alınamadı: {type(e).__name__}: {e}";return
+            results=[]
             for product in products:
-                try:
-                    results.append(self.technical_analyze(product))
-                except Exception as e:
-                    pass
-
-            # Fırsat havuzu: eski 6/7 filtresi çok sertti ve 24 saat hiç işlem
-            # oluşmamasına yol açabiliyordu. Şimdi önce teknik olarak makul adayları
-            # sıralıyor, son kararı AI + risk filtresine bırakıyoruz.
-            results.sort(key=lambda x: (x["score"], x["core_score"], x["change24"], x["volume_ratio"]), reverse=True)
-            self.scanned_count = len(results)
-
-            eligible = [x for x in results if x["score"] >= 4 and x["core_score"] >= 3]
-            if len(eligible) < self.ai_candidates:
-                eligible = [x for x in results if x["score"] >= 3 and x["core_score"] >= 3]
-            candidates = eligible[:self.ai_candidates]
-            fresh_before = dict(self.last_ai_at)
-            self.ai_reviews = self.ai_research(candidates)
-            # Sayacı gerçekten araştırılan/yeni güncellenen adaylar için göster.
-            self.ai_review_count = sum(1 for c in candidates if self.last_ai_at.get(c["symbol"], 0) != fresh_before.get(c["symbol"], 0))
-
-            # AI sonucu panelde tüm adaylarda görünür.
+                try:results.append(self.technical_analyze(product))
+                except:pass
+            results.sort(key=lambda x:(x["score"],x["core_score"],x["change24"],x["volume_ratio"]),reverse=True);self.scanned_count=len(results)
+            eligible=[x for x in results if x["score"]>=4 and x["core_score"]>=3][:self.ai_candidates]
+            fresh_before=dict(self.last_ai_at);self.ai_reviews=self.ai_research(eligible);self.ai_review_count=sum(1 for c in eligible if self.last_ai_at.get(c["symbol"],0)!=fresh_before.get(c["symbol"],0))
             for x in results:
-                if x["symbol"] in self.ai_reviews:
-                    x["ai"] = self.ai_reviews[x["symbol"]]
-                else:
-                    x["ai"] = None
-                x["final_decision"] = (
-                    "AL" if (x.get("ai") or {}).get("decision") == "AL"
-                    and (x.get("ai") or {}).get("score",0) >= self.ai_min_score
-                    else x["decision"]
-                )
-
-            self.signals = {x["symbol"]: x for x in results}
-
-            self.manage_positions()
-
-            # En yüksek teknik + AI skorlu adaylardan al.
-            ranked_buy = [
-                x for x in results
-                if x["decision"] == "AL ADAYI"
-                and (x.get("ai") or {}).get("decision") == "AL"
-                and (x.get("ai") or {}).get("score",0) >= self.ai_min_score
-                and (x.get("ai") or {}).get("risk") != "YÜKSEK"
-            ]
-            ranked_buy.sort(key=lambda x: ((x.get("ai") or {}).get("score",0), x["score"], x["change24"]), reverse=True)
-
-            if not ranked_buy:
-                ai_al = [x for x in results if (x.get("ai") or {}).get("decision") == "AL"]
-                if not ai_al:
-                    self.last_trade_block_reason = f"Alım yok: AI {self.ai_min_score}+ skorlu AL adayı üretmedi."
-                else:
-                    best = max((x.get("ai") or {}).get("score",0) for x in ai_al)
-                    self.last_trade_block_reason = f"Alım yok: en yüksek AI skoru {best}/100; gereken {self.ai_min_score}."
-            else:
-                self.last_trade_block_reason = f"{len(ranked_buy)} uygun AL adayı bulundu; pozisyon açma denendi."
-
-            opened_count = 0
-            for s in ranked_buy:
-                if len(self.positions) >= self.max_positions or self.balance_try < self.min_buy_try:
-                    self.last_trade_block_reason = "Alım sırası durdu: aktif sermaye veya bakiye sınırı."
-                    break
-                if self.open_sim(s):
-                    opened_count += 1
-            if opened_count:
-                self.last_trade_block_reason = f"{opened_count} sanal pozisyon açıldı."
-
-            self.last_scan_ms = int(time.time()*1000)
-
-        finally:
-            self.next_scan_at = time.time() + self.scan_interval_seconds
-            self.last_scan_ms = int(time.time()*1000)
-            self.tick_lock.release()
+                x["ai"]=self.ai_reviews.get(x["symbol"]);x["final_decision"]="AL" if x.get("ai",{}).get("decision")=="AL" and x.get("ai",{}).get("score",0)>=self.ai_min_score else x["decision"]
+            self.signals={x["symbol"]:x for x in results};self.manage_positions()
+            ranked=[x for x in results if x["decision"]=="AL ADAYI" and x.get("ai",{}).get("decision")=="AL" and x.get("ai",{}).get("score",0)>=self.ai_min_score and x.get("ai",{}).get("risk")!="YÜKSEK"]
+            ranked.sort(key=lambda x:(x["ai"]["score"],x["score"],x["change24"]),reverse=True)
+            if not ranked:self.last_trade_block_reason=f"Alım yok: AI {self.ai_min_score}+ skorlu güvenli AL adayı yok."
+            opened=0
+            for s in ranked:
+                if len(self.positions)>=self.max_positions:break
+                if self._open(s):opened+=1
+            if opened:self.last_trade_block_reason=f"{opened} {'canlı' if not self.dry_run else 'sanal'} pozisyon açıldı."
+            self._save_state()
+            self.last_scan_ms=int(time.time()*1000)
+        finally:self.next_scan_at=time.time()+self.scan_interval_seconds;self.lock.release()
 
     def status(self):
         self._reset_daily_stats()
-        market_value = sum(float(p.get("last", p["entry"])) * float(p["qty"]) for p in self.positions.values())
-        unrealized = sum(float(p.get("unrealized", 0)) for p in self.positions.values())
-        equity = self.balance_try + market_value
-        total_pnl = equity - self.initial_balance
-        closed = self.trade_stats["sell_count"]
-        win_rate = (self.trade_stats["wins"] / closed * 100) if closed else 0.0
-
-        ranked = sorted(
-            self.signals.values(),
-            key=lambda x: (
-                x.get("final_decision") == "AL",
-                (x.get("ai") or {}).get("score",0),
-                x.get("score",0),
-                x.get("change24",0)
-            ), reverse=True
-        )
-
-        return {
-            "running": self.running, "dry_run": self.dry_run,
-            "cash_try": round(self.balance_try,2), "balance_try": round(equity,2),
-            "market_value_try": round(market_value,2), "pnl": round(total_pnl,2),
-            "realized_pnl": round(self.realized_pnl,2), "unrealized_pnl": round(unrealized,2),
-            "positions": list(self.positions.values()),
-            "signals": ranked[:25],
-            "scanned_count": self.scanned_count,
-            "ai_review_count": self.ai_review_count,
-            "last_check": self.last_check, "last_error": self.last_error, "trade_block_reason": self.last_trade_block_reason,
-            "last_ai_error": self.last_ai_error, "groq_status": self.last_groq_status,
-            "groq_cooldown_seconds": max(0, int(self.groq_cooldown_until - time.time())),
-            "last_ai_request_at": self.last_ai_request_at, "ai_batch_size": self.ai_batch_size,
-            "scan_interval_seconds": self.scan_interval_seconds,
-            "settings": self.settings(),
-            "data_source": self.data_source,
-            "entry_logic": "Adaptif teknik filtre + Groq AI teknik değerlendirme (web araştırması kapalı) + AI onayı",
-            "exit_logic": f"Min alış {self.min_buy_try:.0f} TL • Min zarar -{self.min_loss_try:.0f} TL • Min kâr +{self.min_profit_try:.0f} TL",
-            "runtime": self.runtime(),
-            "daily_stats": {
-                "day": self.trade_stats["day"],
-                "daily_pnl": round(self.trade_stats["daily_realized_pnl"],2),
-                "total_buy_try": round(self.trade_stats["total_buy_try"],2),
-                "total_sell_try": round(self.trade_stats["total_sell_try"],2),
-                "wins": self.trade_stats["wins"],
-                "losses": self.trade_stats["losses"],
-                "win_rate": round(win_rate,1)
-            },
-            "history": self.history[:30]
-        }
+        if self.dry_run:
+            market_value=sum(p["last"]*p["qty"] for p in self.positions.values());equity=self.balance_try+market_value;cash=self.balance_try
+        else:
+            try:cash=self.cb.usd_available()*self.get_fx();market_value=sum(p["last"]*p["qty"]*self.get_fx() for p in self.positions.values());equity=cash+market_value
+            except Exception as e:cash=0;market_value=0;equity=0;self.last_error=f"Canlı bakiye okunamadı: {e}"
+        total_pnl=equity-self.initial_balance;closed=self.trade_stats["sell_count"];wr=self.trade_stats["wins"]/closed*100 if closed else 0
+        ranked=sorted(self.signals.values(),key=lambda x:(x.get("final_decision")=="AL",x.get("ai",{}).get("score",0),x.get("score",0),x.get("change24",0)),reverse=True)
+        return {"running":self.running,"dry_run":self.dry_run,"live_trading":self.live_trading,"mode":self.mode,"cash_try":money(cash),"balance_try":money(equity),"market_value_try":money(market_value),"pnl":money(total_pnl),"realized_pnl":money(self.realized_pnl),"positions":list(self.positions.values()),"signals":ranked[:25],"scanned_count":self.scanned_count,"ai_review_count":self.ai_review_count,"last_check":self.last_check,"last_error":self.last_error,"trade_block_reason":self.last_trade_block_reason,"last_ai_error":self.last_ai_error,"groq_status":self.last_groq_status,"groq_cooldown_seconds":max(0,int(self.groq_cooldown_until-time.time())),"last_ai_request_at":self.last_ai_request_at,"ai_batch_size":self.ai_batch_size,"scan_interval_seconds":self.scan_interval_seconds,"settings":self.settings(),"data_source":"Coinbase public market data + Coinbase Advanced Trade (canlı modda)","entry_logic":"Teknik filtre + Groq AI + risk motoru + gerçek bakiye kontrolü","exit_logic":f"Min alış {self.min_buy_try:.0f} TL • Min zarar -{self.min_loss_try:.0f} TL • Min kâr +{self.min_profit_try:.0f} TL • trailing {self.trailing*100:.1f}%","runtime":self.runtime(),"daily_stats":{"day":self.trade_stats["day"],"daily_pnl":money(self.trade_stats["daily_realized_pnl"]),"total_buy_try":money(self.trade_stats["total_buy_try"]),"total_sell_try":money(self.trade_stats["total_sell_try"]),"wins":self.trade_stats["wins"],"losses":self.trade_stats["losses"],"win_rate":round(wr,1)},"risk_guard":{"daily_loss_limit_try":self.max_daily_loss_try,"consecutive_losses":self.consecutive_losses,"max_consecutive_losses":self.max_consecutive_losses,"cooldown_seconds":max(0,int(self.cooldown_until-time.time()))},"history":self.history[:30]}
