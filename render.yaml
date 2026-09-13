@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: coinbot-v19
+    name: coinbot-v21-binance
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
@@ -11,24 +11,26 @@ services:
         value: ""
       - key: DRY_RUN
         value: "true"
+      - key: BINANCE_TESTNET
+        value: "true"
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
       - key: DATABASE_URL
-        sync: false
-      - key: COINBASE_API_KEY_NAME
-        sync: false
-      - key: COINBASE_API_PRIVATE_KEY
         sync: false
       - key: GROQ_API_KEY
         sync: false
       - key: AI_MODEL
         value: "openai/gpt-oss-20b"
       - key: AI_FALLBACK_MODEL
-        value: "openai/gpt-oss-20b"
+        value: "llama-3.1-8b-instant"
       - key: AI_CANDIDATES
         value: "8"
       - key: AI_MIN_SCORE
         value: "70"
-      - key: AI_CACHE_MINUTES
-        value: "15"
+      - key: ALLOW_WITHOUT_AI
+        value: "false"
       - key: SCAN_LIMIT
         value: "40"
       - key: SCAN_INTERVAL_SECONDS
@@ -39,17 +41,15 @@ services:
         value: "100"
       - key: MIN_PROFIT_TRY
         value: "150"
-      - key: MAX_DAILY_LOSS_TRY
-        value: "200"
-      - key: MAX_CONSECUTIVE_LOSSES
-        value: "3"
-      - key: LOSS_COOLDOWN_MINUTES
-        value: "30"
       - key: POSITION_SIZE_PCT
         value: "0.25"
       - key: ACTIVE_CAPITAL_PCT
         value: "0.75"
       - key: MAX_OPEN_POSITIONS
         value: "20"
-      - key: ALLOW_WITHOUT_AI
-        value: "false"
+      - key: MAX_DAILY_LOSS_TRY
+        value: "200"
+      - key: MAX_CONSECUTIVE_LOSSES
+        value: "3"
+      - key: LOSS_COOLDOWN_MINUTES
+        value: "30"
